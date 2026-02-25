@@ -11,7 +11,9 @@ Open-source LLM router that saves you money. Simple prompts go to cheap/local mo
 
 NadirClaw sits between your AI tool and your LLM providers as an OpenAI-compatible proxy. It classifies every prompt in ~10ms and routes it to the right model. Works with any tool that speaks the OpenAI API: [OpenClaw](https://openclaw.dev), [Codex](https://github.com/openai/codex), Claude Code, Continue, Cursor, or plain `curl`.
 
-> **How does NadirClaw compare to OpenRouter?** See [NadirClaw vs OpenRouter](docs/comparison.md).
+> **🔒 Your keys. Your models. No middleman.** NadirClaw runs locally and routes directly to providers. No third-party proxy, no subsidized tokens, no platform that can pull the plug on you. [Why this matters.](docs/vs-clawrouter.md)
+
+> **Comparisons:** [NadirClaw vs OpenRouter](docs/comparison.md) | [NadirClaw vs ClawRouter](docs/vs-clawrouter.md)
 
 <p align="center">
   <img src="docs/images/architecture.png" alt="NadirClaw Architecture" width="700" />
