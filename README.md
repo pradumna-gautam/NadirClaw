@@ -25,6 +25,16 @@ NadirClaw sits between your AI tool and your LLM providers as an OpenAI-compatib
   <img src="docs/images/nadirclaw_img.png" alt="NadirClaw in action" width="700" />
 </p>
 
+## Dashboard
+
+Monitor your routing in real-time with `nadirclaw dashboard`:
+
+<p align="center">
+  <img src="docs/images/dashboard.svg" alt="NadirClaw Dashboard" width="800" />
+</p>
+
+Install the dashboard extras: `pip install nadirclaw[dashboard]`
+
 ## Quick Start
 
 ```bash
