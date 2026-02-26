@@ -241,6 +241,49 @@ def savings(since, baseline, fmt):
     click.echo(output)
 
 
+@main.command()
+@click.option("--format", "fmt", default="text", type=click.Choice(["text", "json"]), help="Output format")
+def budget(fmt):
+    """Show current spend and budget status."""
+    from nadirclaw.budget import get_budget_tracker
+
+    tracker = get_budget_tracker()
+    status = tracker.get_status()
+
+    if fmt == "json":
+        click.echo(json.dumps(status, indent=2))
+        return
+
+    click.echo("NadirClaw Budget Status")
+    click.echo("=" * 45)
+
+    # Daily
+    daily = status["daily_spend"]
+    daily_budget = status["daily_budget"]
+    click.echo(f"  Today:   ${daily:.4f}" + (f" / ${daily_budget:.2f}" if daily_budget else ""))
+    click.echo(f"  Reqs:    {status['daily_requests']}")
+
+    # Monthly
+    monthly = status["monthly_spend"]
+    monthly_budget = status["monthly_budget"]
+    click.echo(f"  Month:   ${monthly:.4f}" + (f" / ${monthly_budget:.2f}" if monthly_budget else ""))
+    click.echo(f"  Reqs:    {status['monthly_requests']}")
+
+    # Top models
+    top = status.get("top_models", [])
+    if top:
+        click.echo("")
+        click.echo("Top Models by Spend")
+        click.echo("-" * 45)
+        for m in top[:5]:
+            click.echo(f"  {m['model']:35s}  ${m['spend']:.4f}  ({m['requests']} reqs)")
+
+    if not daily_budget and not monthly_budget:
+        click.echo("")
+        click.echo("Tip: Set NADIRCLAW_DAILY_BUDGET=5.00 and/or")
+        click.echo("     NADIRCLAW_MONTHLY_BUDGET=50.00 to enable alerts.")
+
+
 @main.command(name="build-centroids")
 def build_centroids():
     """Regenerate centroid .npy files from prototype prompts."""

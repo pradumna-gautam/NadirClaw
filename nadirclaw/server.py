@@ -981,6 +981,14 @@ async def chat_completions(
                 latency_ms=elapsed_ms,
             )
 
+        # --- Budget tracking ---
+        from nadirclaw.budget import get_budget_tracker
+        budget_status = get_budget_tracker().record(
+            selected_model,
+            response_data["prompt_tokens"],
+            response_data["completion_tokens"],
+        )
+
         log_entry = {
             "type": "completion",
             "request_id": request_id,
@@ -995,6 +1003,8 @@ async def chat_completions(
             "prompt_tokens": response_data["prompt_tokens"],
             "completion_tokens": response_data["completion_tokens"],
             "total_tokens": total_tokens,
+            "cost": budget_status["cost"],
+            "daily_spend": budget_status["daily_spend"],
             "response_preview": (response_data["content"] or "")[:100],
             "fallback_used": analysis_info.get("fallback_from"),
             "status": "ok",
@@ -1167,6 +1177,15 @@ async def view_logs(
 # ---------------------------------------------------------------------------
 # /v1/models & /health
 # ---------------------------------------------------------------------------
+
+@app.get("/v1/budget")
+async def get_budget(
+    current_user: UserSession = Depends(validate_local_auth),
+) -> Dict[str, Any]:
+    """Get current spend and budget status."""
+    from nadirclaw.budget import get_budget_tracker
+    return get_budget_tracker().get_status()
+
 
 @app.get("/v1/models")
 async def list_models(
