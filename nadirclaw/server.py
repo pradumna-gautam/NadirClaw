@@ -974,6 +974,60 @@ async def chat_completions(
                 cache_hit = True
 
         # ------------------------------------------------------------------
+        # TRUE STREAMING — bypass batch call, stream directly from provider
+        # ------------------------------------------------------------------
+        if request.stream and not cache_hit:
+            from nadirclaw.budget import get_budget_tracker
+            from nadirclaw.telemetry import trace_span
+
+            _stream_analysis = dict(analysis_info)  # mutable copy for stream callbacks
+            _stream_start = start_time
+            _stream_req_meta = req_meta
+            _stream_prompt = prompt_text
+
+            async def _true_stream_wrapper():
+                async for sse_event in _stream_with_fallback(
+                    selected_model, request, provider, _stream_analysis, request_id,
+                ):
+                    yield sse_event
+
+                # After stream completes, log the request
+                stream_elapsed = int((time.time() - _stream_start) * 1000)
+                stream_model = _stream_analysis.get("_stream_model", selected_model)
+                stream_usage = _stream_analysis.get("_stream_usage", {"prompt_tokens": 0, "completion_tokens": 0})
+
+                budget_status = get_budget_tracker().record(
+                    stream_model,
+                    stream_usage["prompt_tokens"],
+                    stream_usage["completion_tokens"],
+                )
+
+                _log_request({
+                    "type": "completion",
+                    "request_id": request_id,
+                    "prompt": _stream_prompt,
+                    "selected_model": stream_model,
+                    "provider": provider,  # approximate; fallback may change provider
+                    "tier": _stream_analysis.get("tier"),
+                    "confidence": _stream_analysis.get("confidence"),
+                    "complexity_score": _stream_analysis.get("complexity_score"),
+                    "classifier_latency_ms": _stream_analysis.get("classifier_latency_ms"),
+                    "total_latency_ms": stream_elapsed,
+                    "prompt_tokens": stream_usage["prompt_tokens"],
+                    "completion_tokens": stream_usage["completion_tokens"],
+                    "total_tokens": stream_usage["prompt_tokens"] + stream_usage["completion_tokens"],
+                    "cost": budget_status["cost"],
+                    "daily_spend": budget_status["daily_spend"],
+                    "response_preview": "[streamed]",
+                    "fallback_used": _stream_analysis.get("fallback_from"),
+                    "streaming": True,
+                    "status": "error" if _stream_analysis.get("_stream_error") else "ok",
+                    **_stream_req_meta,
+                })
+
+            return EventSourceResponse(_true_stream_wrapper(), media_type="text/event-stream")
+
+        # ------------------------------------------------------------------
         # Call model — with automatic fallback on rate limit
         # ------------------------------------------------------------------
         from nadirclaw.telemetry import record_llm_call, trace_span
@@ -1045,7 +1099,7 @@ async def chat_completions(
         _log_request(log_entry)
 
         # ------------------------------------------------------------------
-        # Streaming response (SSE) — for OpenClaw / streaming clients
+        # Streaming response (SSE) — cached stream uses fake wrapper
         # ------------------------------------------------------------------
         if request.stream:
             return _build_streaming_response(
@@ -1171,6 +1225,395 @@ def _build_streaming_response(
         yield {"data": "[DONE]"}
 
     return EventSourceResponse(event_generator(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
+# True streaming — real SSE from providers with mid-stream fallback
+# ---------------------------------------------------------------------------
+
+async def _stream_litellm(
+    model: str,
+    request: "ChatCompletionRequest",
+    provider: str | None,
+):
+    """True streaming via LiteLLM. Yields (delta_dict, usage_dict|None, finish_reason|None) tuples.
+
+    Raises on connection/rate-limit errors (before or during streaming).
+    """
+    import litellm
+
+    from nadirclaw.credentials import get_credential
+
+    if provider == "openai-codex":
+        litellm_model = model.removeprefix("openai-codex/")
+        cred_provider = "openai-codex"
+    else:
+        litellm_model = model
+        cred_provider = provider
+
+    req_extra = request.model_extra or {}
+    if litellm_model.startswith("ollama/") and req_extra.get("tools"):
+        litellm_model = "ollama_chat/" + litellm_model.removeprefix("ollama/")
+
+    messages = []
+    for message in request.messages:
+        text = message.text_content()
+        msg: dict[str, Any] = {"role": message.role, "content": text if text else message.content}
+        extra_fields = message.model_extra or {}
+        if "tool_calls" in extra_fields:
+            msg["tool_calls"] = extra_fields["tool_calls"]
+        if "tool_call_id" in extra_fields:
+            msg["tool_call_id"] = extra_fields["tool_call_id"]
+        if "name" in extra_fields:
+            msg["name"] = extra_fields["name"]
+        messages.append(msg)
+
+    call_kwargs: Dict[str, Any] = {"model": litellm_model, "messages": messages, "stream": True}
+    if request.temperature is not None:
+        call_kwargs["temperature"] = request.temperature
+    if request.max_tokens is not None:
+        call_kwargs["max_tokens"] = request.max_tokens
+    if request.top_p is not None:
+        call_kwargs["top_p"] = request.top_p
+
+    extra = request.model_extra or {}
+    if extra.get("tools"):
+        call_kwargs["tools"] = extra["tools"]
+    if extra.get("tool_choice"):
+        call_kwargs["tool_choice"] = extra["tool_choice"]
+
+    if cred_provider and cred_provider != "ollama":
+        api_key = get_credential(cred_provider)
+        if api_key:
+            call_kwargs["api_key"] = api_key
+
+    if litellm_model.startswith("ollama/") or litellm_model.startswith("ollama_chat/"):
+        call_kwargs["api_base"] = settings.OLLAMA_API_BASE
+
+    try:
+        response = await litellm.acompletion(**call_kwargs)
+    except Exception as e:
+        err_str = str(e).lower()
+        if "429" in err_str or "rate" in err_str or "quota" in err_str or "resource_exhausted" in err_str:
+            raise RateLimitExhausted(model=model, retry_after=60)
+        raise
+
+    async for chunk in response:
+        choice = chunk.choices[0] if chunk.choices else None
+        if choice is None:
+            continue
+        delta = choice.delta
+        delta_dict: dict[str, Any] = {}
+        if hasattr(delta, "role") and delta.role:
+            delta_dict["role"] = delta.role
+        if hasattr(delta, "content") and delta.content is not None:
+            delta_dict["content"] = delta.content
+        if hasattr(delta, "tool_calls") and delta.tool_calls:
+            delta_dict["tool_calls"] = [
+                tc.model_dump() if hasattr(tc, "model_dump") else tc
+                for tc in delta.tool_calls
+            ]
+
+        usage = None
+        if hasattr(chunk, "usage") and chunk.usage:
+            usage = {
+                "prompt_tokens": chunk.usage.prompt_tokens or 0,
+                "completion_tokens": chunk.usage.completion_tokens or 0,
+            }
+
+        yield delta_dict, usage, choice.finish_reason
+
+
+async def _stream_gemini(
+    model: str,
+    request: "ChatCompletionRequest",
+    provider: str | None,
+):
+    """True streaming via Gemini. Yields (delta_dict, usage_dict|None, finish_reason|None) tuples."""
+    import re
+
+    from google.genai import types
+    from google.genai.errors import ClientError
+
+    from nadirclaw.credentials import get_credential
+
+    api_key = get_credential(provider)
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="No Google/Gemini API key configured.",
+        )
+
+    client = _get_gemini_client(api_key)
+    native_model = _strip_gemini_prefix(model)
+
+    system_parts = []
+    contents = []
+    for m in request.messages:
+        if m.role in ("system", "developer"):
+            system_parts.append(m.text_content())
+        else:
+            contents.append(
+                types.Content(
+                    role="user" if m.role == "user" else "model",
+                    parts=[types.Part.from_text(text=m.text_content())],
+                )
+            )
+
+    gen_config_kwargs: Dict[str, Any] = {}
+    if request.temperature is not None:
+        gen_config_kwargs["temperature"] = request.temperature
+    if request.max_tokens is not None:
+        gen_config_kwargs["max_output_tokens"] = request.max_tokens
+    if request.top_p is not None:
+        gen_config_kwargs["top_p"] = request.top_p
+
+    generate_kwargs: Dict[str, Any] = {"model": native_model, "contents": contents}
+    if gen_config_kwargs:
+        generate_kwargs["config"] = types.GenerateContentConfig(
+            **gen_config_kwargs,
+            system_instruction="\n".join(system_parts) if system_parts else None,
+        )
+    elif system_parts:
+        generate_kwargs["config"] = types.GenerateContentConfig(
+            system_instruction="\n".join(system_parts),
+        )
+
+    loop = asyncio.get_running_loop()
+
+    try:
+        # Gemini SDK generate_content_stream is synchronous; wrap in executor
+        stream = await asyncio.wait_for(
+            loop.run_in_executor(
+                _gemini_executor,
+                lambda: client.models.generate_content_stream(**generate_kwargs),
+            ),
+            timeout=120,
+        )
+    except asyncio.TimeoutError:
+        raise Exception(f"Gemini streaming timed out for model={native_model}")
+    except ClientError as e:
+        if e.code == 429 or "RESOURCE_EXHAUSTED" in str(e):
+            raise RateLimitExhausted(model=model, retry_after=60)
+        raise
+
+    # Iterate the synchronous stream in executor
+    def _iter_stream():
+        chunks = []
+        for chunk in stream:
+            chunks.append(chunk)
+        return chunks
+
+    try:
+        all_chunks = await asyncio.wait_for(
+            loop.run_in_executor(_gemini_executor, _iter_stream),
+            timeout=180,
+        )
+    except asyncio.TimeoutError:
+        raise Exception(f"Gemini streaming iteration timed out for model={native_model}")
+
+    for chunk in all_chunks:
+        delta_dict: dict[str, Any] = {}
+        text = ""
+        if hasattr(chunk, "text") and chunk.text:
+            text = chunk.text
+        elif chunk.candidates:
+            candidate = chunk.candidates[0]
+            if hasattr(candidate, "content") and candidate.content and candidate.content.parts:
+                text_parts = [p.text for p in candidate.content.parts if hasattr(p, "text") and p.text]
+                text = "".join(text_parts)
+
+        if text:
+            delta_dict["content"] = text
+
+        usage = None
+        um = getattr(chunk, "usage_metadata", None)
+        if um:
+            usage = {
+                "prompt_tokens": getattr(um, "prompt_token_count", 0) or 0,
+                "completion_tokens": getattr(um, "candidates_token_count", 0) or 0,
+            }
+
+        finish_reason = None
+        if chunk.candidates:
+            raw_reason = getattr(chunk.candidates[0], "finish_reason", None)
+            if raw_reason:
+                reason_str = str(raw_reason).lower()
+                if "safety" in reason_str:
+                    finish_reason = "content_filter"
+                elif "length" in reason_str or "max_tokens" in reason_str:
+                    finish_reason = "length"
+                elif "stop" in reason_str:
+                    finish_reason = "stop"
+
+        if delta_dict or finish_reason:
+            yield delta_dict, usage, finish_reason
+
+
+async def _dispatch_model_stream(
+    model: str,
+    request: "ChatCompletionRequest",
+    provider: str | None,
+):
+    """Route to the correct streaming backend. Yields (delta, usage, finish_reason) tuples."""
+    if provider == "google":
+        async_gen = None
+        # _stream_gemini is a sync generator; wrap it
+        for item in _stream_gemini(model, request, provider):
+            yield item
+    else:
+        async for item in _stream_litellm(model, request, provider):
+            yield item
+
+
+async def _stream_with_fallback(
+    selected_model: str,
+    request: "ChatCompletionRequest",
+    provider: str | None,
+    analysis_info: Dict[str, Any],
+    request_id: str,
+):
+    """True streaming with automatic fallback on pre-content errors.
+
+    Yields OpenAI-compatible SSE data strings. If the primary model fails
+    before yielding any content, transparently switches to fallback models.
+    If it fails mid-stream, yields an error notice and stops.
+    """
+    from nadirclaw.credentials import detect_provider
+
+    models_to_try = [selected_model] + [m for m in settings.FALLBACK_CHAIN if m != selected_model]
+    created = int(time.time())
+    failed_models: list[str] = []
+    last_error: Exception | None = None
+
+    for i, model in enumerate(models_to_try):
+        if i > 0:
+            logger.warning(
+                "⚡ %s failed (%s) — trying streaming fallback %s (%d/%d)",
+                failed_models[-1], type(last_error).__name__, model, i, len(models_to_try) - 1,
+            )
+            provider = detect_provider(model)
+
+        content_started = False
+        accumulated_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        last_finish = None
+
+        try:
+            first_chunk = True
+            async for delta_dict, usage, finish_reason in _dispatch_model_stream(model, request, provider):
+                if usage:
+                    accumulated_usage = usage
+                if finish_reason:
+                    last_finish = finish_reason
+
+                if not delta_dict:
+                    continue
+
+                # Add role on first content chunk
+                if first_chunk and "role" not in delta_dict:
+                    delta_dict["role"] = "assistant"
+                first_chunk = False
+                content_started = True
+
+                chunk = {
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": delta_dict, "finish_reason": None}],
+                }
+                yield {"data": json.dumps(chunk)}
+
+            # Stream completed — send finish chunk with usage
+            finish_chunk = {
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": last_finish or "stop"}],
+                "usage": {
+                    "prompt_tokens": accumulated_usage["prompt_tokens"],
+                    "completion_tokens": accumulated_usage["completion_tokens"],
+                    "total_tokens": accumulated_usage["prompt_tokens"] + accumulated_usage["completion_tokens"],
+                },
+            }
+            yield {"data": json.dumps(finish_chunk)}
+            yield {"data": "[DONE]"}
+
+            # Update analysis_info in-place for logging
+            if failed_models:
+                analysis_info["fallback_from"] = selected_model
+                analysis_info["fallback_chain_tried"] = failed_models
+                analysis_info["selected_model"] = model
+                analysis_info["strategy"] = analysis_info.get("strategy", "smart-routing") + "+fallback"
+            analysis_info["_stream_model"] = model
+            analysis_info["_stream_usage"] = accumulated_usage
+            return  # Success
+
+        except (RateLimitExhausted, Exception) as e:
+            if isinstance(e, HTTPException):
+                raise  # Don't fallback on auth/validation errors
+
+            if content_started:
+                # Mid-stream failure — can't restart, notify client
+                logger.error("Mid-stream failure on %s: %s", model, e)
+                error_chunk = {
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": "\n\n[⚠️ Stream interrupted — model error mid-response]"},
+                        "finish_reason": None,
+                    }],
+                }
+                yield {"data": json.dumps(error_chunk)}
+                finish_chunk = {
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+                yield {"data": json.dumps(finish_chunk)}
+                yield {"data": "[DONE]"}
+                analysis_info["_stream_model"] = model
+                analysis_info["_stream_usage"] = accumulated_usage
+                analysis_info["_stream_error"] = str(e)
+                return
+
+            # Pre-content failure — can try fallback
+            failed_models.append(model)
+            last_error = e
+            continue
+
+    # All models exhausted
+    logger.error("All streaming models exhausted: %s", failed_models)
+    error_chunk = {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": selected_model,
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "content": "⚠️ All configured models are currently unavailable. Please try again shortly."},
+            "finish_reason": None,
+        }],
+    }
+    yield {"data": json.dumps(error_chunk)}
+    finish_chunk = {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": selected_model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    }
+    yield {"data": json.dumps(finish_chunk)}
+    yield {"data": "[DONE]"}
+    analysis_info["_stream_model"] = selected_model
+    analysis_info["_stream_usage"] = {"prompt_tokens": 0, "completion_tokens": 0}
+    analysis_info["_stream_error"] = "all_models_exhausted"
 
 
 # ---------------------------------------------------------------------------

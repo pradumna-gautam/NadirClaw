@@ -404,7 +404,7 @@ class TestStreamingToolCalls:
                 events.append(event)
             return events
 
-        events = asyncio.get_event_loop().run_until_complete(collect_events())
+        events = asyncio.run(collect_events())
 
         data_events = [e for e in events if isinstance(e, dict) and "data" in e]
         assert len(data_events) >= 2

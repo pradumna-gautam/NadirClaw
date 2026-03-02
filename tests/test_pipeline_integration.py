@@ -368,12 +368,37 @@ class TestBudgetIntegration:
 
 class TestStreamingPipeline:
 
-    @patch("nadirclaw.server._call_with_fallback")
-    def test_streaming_returns_sse(self, mock_fallback, client):
-        """Streaming requests should return SSE-formatted chunks."""
-        mock_fallback.side_effect = _make_fallback_mock(
-            content="Streamed response", prompt_tokens=10, completion_tokens=5,
-        ).side_effect
+    @patch("nadirclaw.server._stream_with_fallback")
+    def test_streaming_returns_sse(self, mock_stream, client):
+        """Streaming requests should return SSE-formatted chunks via true streaming."""
+        import time as _time
+
+        created = int(_time.time())
+        request_id = "chatcmpl-test"
+
+        async def _fake_stream(*args, **kwargs):
+            # Simulate true streaming: role+content chunk, then finish
+            yield {"data": json.dumps({
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": "test-model",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Streamed response"}, "finish_reason": None}],
+            })}
+            yield {"data": json.dumps({
+                "id": request_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": "test-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            })}
+            yield {"data": "[DONE]"}
+            # Set analysis_info for logging
+            args[3]["_stream_model"] = "test-model"
+            args[3]["_stream_usage"] = {"prompt_tokens": 10, "completion_tokens": 5}
+
+        mock_stream.side_effect = _fake_stream
 
         resp = client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "Hello"}],
