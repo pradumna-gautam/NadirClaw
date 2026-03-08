@@ -1,48 +1,59 @@
-# NadirClaw — Open-Source LLM Router & AI Cost Optimizer
-<img alt="NadirClaw — Smart LLM Router for AI Cost Reduction" src="logo_rb.png" />
+<p align="center">
+  <a href="https://getnadir.com">
+    <img src="docs/images/banner.png" alt="NadirClaw — Cut LLM & Agent Costs 40-70%" width="100%" />
+  </a>
+</p>
 
-[![PyPI](https://img.shields.io/pypi/v/nadirclaw)](https://pypi.org/project/nadirclaw/)
-[![CI](https://github.com/doramirdor/NadirClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/doramirdor/NadirClaw/actions)
-[![Python](https://img.shields.io/pypi/pyversions/nadirclaw)](https://pypi.org/project/nadirclaw/)
-[![License](https://img.shields.io/github/license/doramirdor/NadirClaw)](LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/doramirdor/NadirClaw?style=social)](https://github.com/doramirdor/NadirClaw)
+<h1 align="center">NadirClaw</h1>
 
-**NadirClaw is an open-source LLM router that reduces your AI API costs by 40-70%.** It automatically routes simple prompts to cheap or local models and complex prompts to premium models — no code changes required.
+<p align="center">
+  <strong>Your simple prompts are burning premium tokens.</strong><br>
+  NadirClaw routes them to cheaper models automatically. Save 40-70% on AI API costs.
+</p>
 
-NadirClaw runs locally as an **OpenAI-compatible proxy** and sits between your AI tools and LLM providers. It classifies every prompt in ~10ms using sentence embeddings and routes it to the optimal model. Drop-in compatible with [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Codex](https://github.com/openai/codex), [OpenClaw](https://openclaw.dev), Continue, Cursor, or any OpenAI API client.
+<p align="center">
+  <a href="https://pypi.org/project/nadirclaw/"><img src="https://img.shields.io/pypi/v/nadirclaw" alt="PyPI" /></a>
+  <a href="https://github.com/doramirdor/NadirClaw/actions"><img src="https://github.com/doramirdor/NadirClaw/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://pypi.org/project/nadirclaw/"><img src="https://img.shields.io/pypi/pyversions/nadirclaw" alt="Python" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/doramirdor/NadirClaw" alt="License" /></a>
+  <a href="https://github.com/doramirdor/NadirClaw"><img src="https://img.shields.io/github/stars/doramirdor/NadirClaw?style=social" alt="GitHub stars" /></a>
+</p>
+
+<p align="center">
+  Works with <strong>Claude Code</strong> · <strong>Cursor</strong> · <strong>Aider</strong> · <strong>Windsurf</strong> · <strong>Codex</strong> · <strong>OpenClaw</strong> · Any OpenAI-compatible client
+</p>
+
+<p align="center">
+  <a href="https://getnadir.com">Website</a> · <a href="#quick-start">Quick Start</a> · <a href="docs/comparison.md">Comparisons</a> · <a href="https://github.com/doramirdor/nadirclaw-action">GitHub Action</a>
+</p>
+
+---
 
 ## Why NadirClaw?
 
-Most LLM requests don't need a premium model. In typical coding agent sessions, **60-70% of prompts are simple** (reading files, short questions, continuations) and can be handled by models that cost 10-20x less. NadirClaw detects this automatically and routes accordingly — no prompt engineering, no code changes, no third-party service.
+Most LLM requests don't need a premium model. In typical coding sessions, **60-70% of prompts are simple** — reading files, short questions, formatting. They can be handled by models that cost 10-20x less.
 
-**Key benefits:**
-- 💰 **Cut AI API costs by 40-70%** — real savings from day one
-- ⚡ **~10ms classification overhead** — you won't notice it
-- 🔌 **Drop-in proxy** — works with any OpenAI-compatible tool
-- 🏠 **Runs locally** — your API keys never leave your machine
-- 🔄 **Fallback chains** — automatic failover when models are down
-- 📊 **Built-in cost tracking** — dashboard, reports, budget alerts
+```
+$ nadirclaw serve
+✓ Classifier ready — Listening on localhost:8856
 
-> **🔒 Your keys. Your models. No middleman.** NadirClaw runs locally and routes directly to providers. No third-party proxy, no subsidized tokens, no platform that can pull the plug on you. [Why this matters.](docs/vs-clawrouter.md)
+SIMPLE  "What is 2+2?"              → gemini-flash    $0.0002
+SIMPLE  "Format this JSON"          → haiku-4.5       $0.0004
+COMPLEX "Refactor auth module..."   → claude-sonnet    $0.098
+COMPLEX "Debug race condition..."   → gpt-5.2          $0.450
+SIMPLE  "Write a docstring"         → gemini-flash    $0.0002
 
-> **Comparisons:** [NadirClaw vs OpenRouter](docs/comparison.md) | [NadirClaw vs ClawRouter](docs/vs-clawrouter.md)
->
-> **CI/CD?** Use the [NadirClaw GitHub Action](https://github.com/doramirdor/nadirclaw-action) to route your CI LLM calls automatically.
+3 of 5 routed cheaper · $0.549 vs $1.37 all-premium · 60% saved
+```
 
-<p align="center">
-  <img src="docs/images/architecture.png" alt="NadirClaw Architecture" width="700" />
-</p>
+- **Cut AI API costs 40-70%** — real savings from day one
+- **~10ms classification overhead** — you won't notice it
+- **Drop-in proxy** — works with any OpenAI-compatible tool
+- **Runs locally** — your API keys never leave your machine
+- **Fallback chains** — automatic failover when models are down
+- **Built-in cost tracking** — dashboard, reports, budget alerts
 
-
-## Dashboard
-
-Monitor your routing in real-time with `nadirclaw dashboard`:
-
-<p align="center">
-  <img src="docs/images/dashboard.svg" alt="NadirClaw Dashboard" width="800" />
-</p>
-
-Install the dashboard extras: `pip install nadirclaw[dashboard]`
+> **Your keys. Your models. No middleman.** NadirClaw runs locally and routes directly to providers. No third-party proxy, no subsidized tokens, no platform that can pull the plug on you. [Why this matters.](docs/vs-clawrouter.md)
 
 ## Quick Start
 
@@ -94,6 +105,20 @@ That's it. NadirClaw starts on `http://localhost:8856` with sensible defaults (G
 - **Prompt caching** — in-memory LRU cache for identical chat completions, skipping redundant LLM calls entirely. Configurable TTL and max size via `NADIRCLAW_CACHE_TTL` and `NADIRCLAW_CACHE_MAX_SIZE`. Monitor with `nadirclaw cache` or the `/v1/cache` endpoint
 - **Live dashboard** — `nadirclaw dashboard` for terminal, or visit `http://localhost:8856/dashboard` for a web UI with real-time stats, cost tracking, and model usage
 - **GitHub Action** — [`doramirdor/nadirclaw-action`](https://github.com/doramirdor/nadirclaw-action) for CI/CD pipelines
+
+## Dashboard
+
+Monitor your routing in real-time with `nadirclaw dashboard`:
+
+<p align="center">
+  <img src="docs/images/dashboard.svg" alt="NadirClaw Dashboard" width="800" />
+</p>
+
+Install the dashboard extras: `pip install nadirclaw[dashboard]`
+
+<p align="center">
+  <img src="docs/images/architecture.png" alt="NadirClaw Architecture" width="700" />
+</p>
 
 ## Prerequisites
 
