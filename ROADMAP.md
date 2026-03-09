@@ -1,6 +1,6 @@
 # NadirClaw Roadmap
 
-> **Current version:** v0.7.0 (March 2026) · **Window:** March – June 2026
+> **Current version:** v0.9.0 (March 2026) · **Window:** March – June 2026
 
 This is a near-term, concrete roadmap — not a vision doc. Items are grounded in real gaps in the
 codebase today. Dates are targets, not guarantees. Check the [CHANGELOG](CHANGELOG.md) for what
@@ -45,6 +45,8 @@ has already shipped.
 
 ## v0.9.1 — Ecosystem Expansion _(~3 weeks)_
 
+- [x] **Open WebUI integration** — `nadirclaw openwebui onboard` with setup instructions;
+      `/v1/models` now returns routing profiles (`auto`, `eco`, `premium`) for auto-discovery
 - [ ] **Editor onboard commands** — `nadirclaw continue onboard` and `nadirclaw cursor onboard`
       for [Continue](https://continue.dev) and [Cursor](https://cursor.sh); mirrors the existing
       `openclaw` and `codex` onboard pattern

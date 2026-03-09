@@ -1791,19 +1791,23 @@ async def get_rate_limits(
 async def list_models(
     current_user: UserSession = Depends(validate_local_auth),
 ) -> Dict[str, Any]:
-    models = settings.tier_models
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": m,
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": m.split("/")[0] if "/" in m else "api",
-            }
-            for m in models
-        ],
-    }
+    now = int(time.time())
+    # Routing profiles first, then tier models
+    profiles = [
+        {"id": "auto", "object": "model", "created": now, "owned_by": "nadirclaw"},
+        {"id": "eco", "object": "model", "created": now, "owned_by": "nadirclaw"},
+        {"id": "premium", "object": "model", "created": now, "owned_by": "nadirclaw"},
+    ]
+    tier_data = [
+        {
+            "id": m,
+            "object": "model",
+            "created": now,
+            "owned_by": m.split("/")[0] if "/" in m else "api",
+        }
+        for m in settings.tier_models
+    ]
+    return {"object": "list", "data": profiles + tier_data}
 
 
 @app.get("/metrics")

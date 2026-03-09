@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  Works with <strong>Claude Code</strong> · <strong>Cursor</strong> · <strong>Aider</strong> · <strong>Windsurf</strong> · <strong>Codex</strong> · <strong>OpenClaw</strong> · Any OpenAI-compatible client
+  Works with <strong>Claude Code</strong> · <strong>Cursor</strong> · <strong>Aider</strong> · <strong>Windsurf</strong> · <strong>Codex</strong> · <strong>OpenClaw</strong> · <strong>Open WebUI</strong> · Any OpenAI-compatible client
 </p>
 
 <p align="center">
@@ -504,6 +504,26 @@ Claude Code sends every request to Anthropic's API. With NadirClaw in front, eac
 
 Streaming works as expected. In typical Claude Code usage, 40-70% of prompts are simple enough to route to a cheaper model, which translates directly to cost savings.
 
+## Usage with Open WebUI
+
+[Open WebUI](https://openwebui.com) is a popular self-hosted AI interface. NadirClaw works as a drop-in OpenAI-compatible provider:
+
+```bash
+# View setup instructions
+nadirclaw openwebui onboard
+```
+
+### Quick Setup
+
+1. Start NadirClaw: `nadirclaw serve`
+2. In Open WebUI, go to **Admin Settings** → **Connections** → **OpenAI** → **Add Connection**
+3. Enter:
+   - **URL:** `http://localhost:8856/v1`
+   - **API Key:** `local`
+4. Select the `auto` model in your chat
+
+Open WebUI will auto-discover NadirClaw's available models (`auto`, `eco`, `premium`, plus your configured tier models). The `auto` model routes each prompt to the right model automatically — simple prompts go to cheap models, complex ones to premium.
+
 ## Usage with Any OpenAI-Compatible Tool
 
 NadirClaw exposes a standard OpenAI-compatible API. Point any tool at it:
@@ -671,6 +691,7 @@ nadirclaw auth gemini login       # Login with Google Gemini (OAuth, opens brows
 nadirclaw auth gemini logout      # Remove stored Gemini OAuth credential
 nadirclaw codex onboard         # Configure Codex integration
 nadirclaw openclaw onboard   # Configure OpenClaw integration
+nadirclaw openwebui onboard  # Show Open WebUI setup instructions
 nadirclaw build-centroids    # Regenerate centroid vectors from prototypes
 ```
 

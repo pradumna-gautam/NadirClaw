@@ -999,6 +999,44 @@ api_key = "local"
 
 
 @main.group()
+def openwebui():
+    """Open WebUI integration commands."""
+    pass
+
+
+@openwebui.command()
+def onboard():
+    """Show setup instructions for Open WebUI integration."""
+    from nadirclaw.settings import settings
+
+    url = f"http://localhost:{settings.PORT}/v1"
+
+    click.echo("\nOpen WebUI + NadirClaw Setup")
+    click.echo("=" * 50)
+    click.echo()
+    click.echo("1. Start NadirClaw:")
+    click.echo(f"   nadirclaw serve")
+    click.echo()
+    click.echo("2. In Open WebUI, go to:")
+    click.echo("   Admin Settings → Connections → OpenAI → Add Connection")
+    click.echo()
+    click.echo("3. Enter:")
+    click.echo(f"   URL:     {url}")
+    click.echo(f"   API Key: local")
+    click.echo()
+    click.echo("4. Select the 'auto' model in your chat — NadirClaw routes")
+    click.echo("   each prompt to the right model automatically.")
+    click.echo()
+    click.echo("Available models:")
+    click.echo("   auto      Smart routing (default)")
+    click.echo("   eco       Always use cheap model")
+    click.echo("   premium   Always use best model")
+    click.echo()
+    click.echo(f"Verify: curl {url}/models")
+    click.echo()
+
+
+@main.group()
 def ollama():
     """Ollama discovery and management commands."""
     pass
