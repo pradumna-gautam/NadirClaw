@@ -103,11 +103,12 @@ class BinaryComplexityClassifier:
         start = time.time()
         is_complex, confidence = self.classify(text)
 
-        recommended_model, recommended_provider = self._select_model(is_complex)
-
         complexity_score = self._confidence_to_score(is_complex, confidence)
-        tier = 3 if is_complex else 1
-        tier_name = "complex" if is_complex else "simple"
+
+        # Three-tier routing: use score thresholds to determine tier
+        tier_name, tier = self._score_to_tier(complexity_score)
+
+        recommended_model, recommended_provider = self._select_model_by_tier(tier_name)
 
         latency_ms = int((time.time() - start) * 1000)
 
@@ -121,8 +122,8 @@ class BinaryComplexityClassifier:
             "tier": tier,
             "tier_name": tier_name,
             "reasoning": (
-                f"Binary classifier: {'complex' if is_complex else 'simple'} "
-                f"(confidence={confidence:.3f})"
+                f"Binary classifier: {tier_name} "
+                f"(score={complexity_score:.3f}, confidence={confidence:.3f})"
             ),
             "ranked_models": [],
             "analyzer_latency_ms": latency_ms,
@@ -137,10 +138,24 @@ class BinaryComplexityClassifier:
 
     @staticmethod
     def _select_model(is_complex: bool) -> Tuple[str, str]:
-        """Pick the model based on tier classification."""
+        """Pick the model based on binary tier classification (legacy)."""
         from nadirclaw.settings import settings
 
         model = settings.COMPLEX_MODEL if is_complex else settings.SIMPLE_MODEL
+        provider = model.split("/")[0] if "/" in model else "api"
+        return model, provider
+
+    @staticmethod
+    def _select_model_by_tier(tier_name: str) -> Tuple[str, str]:
+        """Pick the model based on three-tier classification."""
+        from nadirclaw.settings import settings
+
+        if tier_name == "complex":
+            model = settings.COMPLEX_MODEL
+        elif tier_name == "mid":
+            model = settings.MID_MODEL
+        else:
+            model = settings.SIMPLE_MODEL
         provider = model.split("/")[0] if "/" in model else "api"
         return model, provider
 
@@ -151,6 +166,33 @@ class BinaryComplexityClassifier:
             return 0.5 + min(confidence * 5, 0.5)
         else:
             return 0.5 - min(confidence * 5, 0.5)
+
+    @staticmethod
+    def _score_to_tier(complexity_score: float) -> Tuple[str, int]:
+        """Map a 0-1 complexity score to a tier name and numeric tier.
+
+        Uses configurable thresholds from NADIRCLAW_TIER_THRESHOLDS.
+        If MID_MODEL is not set, falls back to binary (simple/complex).
+
+        Returns (tier_name, tier_number).
+        """
+        from nadirclaw.settings import settings
+
+        simple_max, complex_min = settings.TIER_THRESHOLDS
+
+        if settings.has_mid_tier:
+            if complexity_score <= simple_max:
+                return "simple", 1
+            elif complexity_score >= complex_min:
+                return "complex", 3
+            else:
+                return "mid", 2
+        else:
+            # No mid model configured — binary routing
+            if complexity_score >= 0.5:
+                return "complex", 3
+            else:
+                return "simple", 1
 
 
 # ---------------------------------------------------------------------------

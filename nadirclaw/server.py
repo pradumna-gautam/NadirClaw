@@ -258,24 +258,33 @@ async def startup():
     if setup_telemetry("nadirclaw"):
         instrument_fastapi(app)
 
-    # Warm up the binary classifier
-    try:
-        from nadirclaw.classifier import warmup
-        logger.info("Warming up binary classifier...")
-        warmup()
-        logger.info("Binary classifier ready")
-    except Exception as e:
-        logger.error("Failed to warm binary classifier: %s", e)
-        raise
+    # Classifier is lazy-loaded on first request (cuts cold-start time).
+    # Pre-warm in background thread so first request is fast.
+    import threading
+
+    def _background_warmup():
+        try:
+            from nadirclaw.classifier import warmup
+            warmup()
+            logger.info("Binary classifier warmed up (background)")
+        except Exception as e:
+            logger.warning("Background warmup failed (will retry on first request): %s", e)
+
+    threading.Thread(target=_background_warmup, daemon=True, name="classifier-warmup").start()
 
     # Show config
     try:
         import litellm
         litellm.set_verbose = False
         logger.info("Simple model:  %s", settings.SIMPLE_MODEL)
+        if settings.has_mid_tier:
+            logger.info("Mid model:     %s", settings.MID_MODEL)
         logger.info("Complex model: %s", settings.COMPLEX_MODEL)
         if settings.has_explicit_tiers:
             logger.info("Tier config:   explicit (env vars)")
+        elif settings.has_mid_tier:
+            thresholds = settings.TIER_THRESHOLDS
+            logger.info("Tier config:   3-tier (thresholds: %.2f / %.2f)", thresholds[0], thresholds[1])
         else:
             logger.info("Tier config:   derived from NADIRCLAW_MODELS")
         logger.info("Ollama base:   %s", settings.OLLAMA_API_BASE)
@@ -320,8 +329,13 @@ async def _smart_route_analysis(
         analyzer = get_binary_classifier()
         result = await analyzer.analyze(text=prompt, system_message=system_message)
 
-        is_complex = result.get("tier_name") == "complex"
-        selected = settings.COMPLEX_MODEL if is_complex else settings.SIMPLE_MODEL
+        tier_name = result.get("tier_name", "simple")
+        if tier_name == "complex":
+            selected = settings.COMPLEX_MODEL
+        elif tier_name == "mid":
+            selected = settings.MID_MODEL
+        else:
+            selected = settings.SIMPLE_MODEL
 
         analysis = {
             "strategy": "smart-routing",

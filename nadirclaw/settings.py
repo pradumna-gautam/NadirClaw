@@ -77,6 +77,37 @@ class Settings:
         return float(os.getenv("NADIRCLAW_CONFIDENCE_THRESHOLD", "0.06"))
 
     @property
+    def MID_MODEL(self) -> str:
+        """Model for mid-complexity prompts. Falls back to SIMPLE_MODEL."""
+        return os.getenv("NADIRCLAW_MID_MODEL", "") or self.SIMPLE_MODEL
+
+    @property
+    def TIER_THRESHOLDS(self) -> tuple[float, float]:
+        """Score thresholds for 3-tier routing: (simple_max, complex_min).
+
+        Prompts with score <= simple_max → simple tier.
+        Prompts with score >= complex_min → complex tier.
+        Prompts in between → mid tier.
+
+        Set NADIRCLAW_TIER_THRESHOLDS=0.35,0.65 to customize.
+        Default: (0.35, 0.65).
+        """
+        raw = os.getenv("NADIRCLAW_TIER_THRESHOLDS", "")
+        if raw:
+            parts = [p.strip() for p in raw.split(",")]
+            if len(parts) == 2:
+                try:
+                    return (float(parts[0]), float(parts[1]))
+                except ValueError:
+                    pass
+        return (0.35, 0.65)
+
+    @property
+    def has_mid_tier(self) -> bool:
+        """True if MID_MODEL is explicitly set via env."""
+        return bool(os.getenv("NADIRCLAW_MID_MODEL"))
+
+    @property
     def PORT(self) -> int:
         return int(os.getenv("NADIRCLAW_PORT", "8856"))
 
@@ -116,7 +147,7 @@ class Settings:
             return [m.strip() for m in raw.split(",") if m.strip()]
         # Default: deduplicated list of all configured tier models
         chain = []
-        for m in [self.COMPLEX_MODEL, self.SIMPLE_MODEL, self.REASONING_MODEL, self.FREE_MODEL]:
+        for m in [self.COMPLEX_MODEL, self.MID_MODEL, self.SIMPLE_MODEL, self.REASONING_MODEL, self.FREE_MODEL]:
             if m and m not in chain:
                 chain.append(m)
         return chain
@@ -143,9 +174,11 @@ class Settings:
 
     @property
     def tier_models(self) -> list[str]:
-        """Deduplicated list of [COMPLEX_MODEL, SIMPLE_MODEL]."""
+        """Deduplicated list of tier models: [COMPLEX, MID, SIMPLE]."""
         models = [self.COMPLEX_MODEL]
-        if self.SIMPLE_MODEL != self.COMPLEX_MODEL:
+        if self.has_mid_tier and self.MID_MODEL not in models:
+            models.append(self.MID_MODEL)
+        if self.SIMPLE_MODEL not in models:
             models.append(self.SIMPLE_MODEL)
         return models
 

@@ -176,10 +176,14 @@ def status():
 @click.option("--model", default=None, help="Filter by model name (substring match)")
 @click.option("--format", "fmt", default="text", type=click.Choice(["text", "json"]), help="Output format")
 @click.option("--export", "export_path", default=None, type=click.Path(), help="Export report to file")
-def report(since, model, fmt, export_path):
+@click.option("--by-model", is_flag=True, help="Show per-model cost breakdown")
+@click.option("--by-day", is_flag=True, help="Show per-day cost breakdown")
+def report(since, model, fmt, export_path, by_model, by_day):
     """Show a summary report of request logs (reads SQLite first, falls back to JSONL)."""
     from nadirclaw.report import (
+        format_cost_breakdown_text,
         format_report_text,
+        generate_cost_breakdown,
         generate_report,
         load_log_entries,
         load_log_entries_sqlite,
@@ -208,12 +212,19 @@ def report(since, model, fmt, export_path):
     else:
         entries = load_log_entries(jsonl_path, since=since_dt, model_filter=model)
 
-    report_data = generate_report(entries)
-
-    if fmt == "json":
-        output = json.dumps(report_data, indent=2, default=str)
+    if by_model or by_day:
+        # Cost breakdown mode
+        breakdown_data = generate_cost_breakdown(entries, by_model=by_model, by_day=by_day)
+        if fmt == "json":
+            output = json.dumps(breakdown_data, indent=2, default=str)
+        else:
+            output = format_cost_breakdown_text(breakdown_data)
     else:
-        output = format_report_text(report_data)
+        report_data = generate_report(entries)
+        if fmt == "json":
+            output = json.dumps(report_data, indent=2, default=str)
+        else:
+            output = format_report_text(report_data)
 
     if export_path:
         Path(export_path).write_text(output)
@@ -358,6 +369,66 @@ def cache(fmt):
     hit_rate = data.get('hit_rate', 0)
     click.echo(f"  Hit rate:   {hit_rate:.1%}")
     click.echo(f"  Lookups:    {data.get('total_lookups', 0)}")
+
+
+@main.command()
+@click.option("--format", "fmt", default="csv", type=click.Choice(["csv", "jsonl"]), help="Export format")
+@click.option("--since", default=None, help="Time filter: '24h', '7d', '2025-02-01'")
+@click.option("--model", default=None, help="Filter by model name (substring match)")
+@click.option("--output", "-o", "output_path", default=None, type=click.Path(), help="Output file (default: stdout)")
+def export(fmt, since, model, output_path):
+    """Export request logs for offline analysis."""
+    import csv
+    import io
+
+    from nadirclaw.report import load_log_entries, load_log_entries_sqlite, parse_since
+    from nadirclaw.settings import settings
+
+    db_path = settings.LOG_DIR / "requests.db"
+    jsonl_path = settings.LOG_DIR / "requests.jsonl"
+
+    if not db_path.exists() and not jsonl_path.exists():
+        click.echo("No log file found. Start the server and make some requests first.")
+        return
+
+    since_dt = None
+    if since:
+        try:
+            since_dt = parse_since(since)
+        except ValueError as e:
+            click.echo(f"Error: {e}")
+            raise SystemExit(1)
+
+    # Prefer SQLite
+    if db_path.exists():
+        entries = load_log_entries_sqlite(db_path, since=since_dt, model_filter=model)
+    else:
+        entries = load_log_entries(jsonl_path, since=since_dt, model_filter=model)
+
+    if not entries:
+        click.echo("No matching entries found.")
+        return
+
+    if fmt == "csv":
+        # Determine columns from first entry
+        columns = list(entries[0].keys())
+
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        for entry in entries:
+            writer.writerow(entry)
+        output = buf.getvalue()
+    else:
+        # JSONL
+        lines = [json.dumps(entry, default=str) for entry in entries]
+        output = "\n".join(lines) + "\n"
+
+    if output_path:
+        Path(output_path).write_text(output)
+        click.echo(f"Exported {len(entries)} entries to {output_path}")
+    else:
+        click.echo(output, nl=False)
 
 
 @main.command(name="build-centroids")
@@ -1033,6 +1104,114 @@ def onboard():
     click.echo("   premium   Always use best model")
     click.echo()
     click.echo(f"Verify: curl {url}/models")
+    click.echo()
+
+
+@main.group()
+def continue_dev():
+    """Continue (continue.dev) integration commands."""
+    pass
+
+
+@continue_dev.command()
+def onboard():
+    """Auto-configure Continue to use NadirClaw as a provider."""
+    from nadirclaw.settings import settings
+
+    config_dir = Path.home() / ".continue"
+    config_path = config_dir / "config.json"
+
+    # Backup existing config if present
+    existing = {}
+    if config_path.exists():
+        try:
+            with open(config_path) as f:
+                existing = json.load(f)
+            backup_path = config_path.with_suffix(
+                f".backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+            )
+            shutil.copy2(config_path, backup_path)
+            click.echo(f"Backed up existing config to {backup_path}")
+        except Exception as e:
+            click.echo(f"Warning: could not read existing config: {e}")
+
+    # Build the NadirClaw model entry
+    nadirclaw_model = {
+        "title": "NadirClaw Auto",
+        "provider": "openai",
+        "model": "auto",
+        "apiBase": f"http://localhost:{settings.PORT}/v1",
+        "apiKey": "local",
+    }
+
+    # Merge into existing config
+    if "models" not in existing:
+        existing["models"] = []
+
+    # Remove any existing NadirClaw entries
+    existing["models"] = [
+        m for m in existing["models"]
+        if not (m.get("apiBase", "").startswith(f"http://localhost:{settings.PORT}"))
+    ]
+    existing["models"].insert(0, nadirclaw_model)
+
+    # Write config
+    config_dir.mkdir(parents=True, exist_ok=True)
+    with open(config_path, "w") as f:
+        json.dump(existing, f, indent=2)
+
+    click.echo(f"\nWrote Continue config to {config_path}")
+    click.echo(f"\nNadirClaw added as the first model in Continue.")
+    click.echo(f"  Model: auto (smart routing)")
+    click.echo(f"  API Base: http://localhost:{settings.PORT}/v1")
+    click.echo("\nNext steps:")
+    click.echo("  1. Start NadirClaw:  nadirclaw serve")
+    click.echo("  2. Open Continue in your editor (VS Code / JetBrains)")
+    click.echo("  3. Select 'NadirClaw Auto' from the model dropdown")
+
+
+# Rename the Click group to use "continue" as CLI name (Python keyword workaround)
+continue_dev.name = "continue"
+
+
+@main.group()
+def cursor():
+    """Cursor editor integration commands."""
+    pass
+
+
+@cursor.command()
+def onboard():
+    """Auto-configure Cursor to use NadirClaw as an OpenAI-compatible provider."""
+    from nadirclaw.settings import settings
+
+    cursor_dir = Path.home() / ".cursor"
+    config_path = cursor_dir / "mcp.json"
+
+    click.echo("\nCursor + NadirClaw Setup")
+    click.echo("=" * 50)
+    click.echo()
+    click.echo("Cursor supports OpenAI-compatible providers natively.")
+    click.echo("Follow these steps to connect NadirClaw:\n")
+    click.echo("1. Start NadirClaw:")
+    click.echo("   nadirclaw serve")
+    click.echo()
+    click.echo("2. In Cursor, go to:")
+    click.echo("   Settings → Models → OpenAI API Key")
+    click.echo()
+    click.echo("3. Enter these values:")
+    click.echo(f"   API Key:      local")
+    click.echo(f"   Base URL:     http://localhost:{settings.PORT}/v1")
+    click.echo(f"   Model name:   auto")
+    click.echo()
+    click.echo("4. Click 'Verify' to test the connection, then save.")
+    click.echo()
+    click.echo("Available models:")
+    click.echo("   auto      Smart routing (recommended)")
+    click.echo("   eco       Always use cheap model")
+    click.echo("   premium   Always use best model")
+    click.echo()
+    click.echo(f"Verify: curl http://localhost:{settings.PORT}/v1/models")
     click.echo()
 
 

@@ -329,6 +329,148 @@ def format_report_text(report: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Per-model, per-day cost breakdown
+# ---------------------------------------------------------------------------
+
+def generate_cost_breakdown(
+    entries: List[Dict[str, Any]],
+    by_model: bool = False,
+    by_day: bool = False,
+) -> Dict[str, Any]:
+    """Generate cost breakdown by model, by day, or both.
+
+    Also flags anomalies: any model whose daily spend is > 2× its 7-day average.
+    """
+    if not entries:
+        return {"total_cost": 0, "breakdown": [], "anomalies": []}
+
+    # Build per-model-per-day aggregation
+    buckets: Dict[str, Dict[str, Dict[str, Any]]] = {}  # model → day → stats
+    for e in entries:
+        model = e.get("selected_model") or "unknown"
+        ts_str = e.get("timestamp")
+        day = "all"
+        if ts_str:
+            try:
+                day = datetime.fromisoformat(ts_str).strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                pass
+        cost = _safe_float(e.get("cost")) or 0.0
+        pt = _safe_int(e.get("prompt_tokens", 0))
+        ct = _safe_int(e.get("completion_tokens", 0))
+
+        if model not in buckets:
+            buckets[model] = {}
+        if day not in buckets[model]:
+            buckets[model][day] = {"requests": 0, "cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
+        buckets[model][day]["requests"] += 1
+        buckets[model][day]["cost"] += cost
+        buckets[model][day]["prompt_tokens"] += pt
+        buckets[model][day]["completion_tokens"] += ct
+
+    # Build output rows
+    rows: List[Dict[str, Any]] = []
+
+    if by_model and by_day:
+        for model in sorted(buckets.keys()):
+            for day in sorted(buckets[model].keys()):
+                row = {"model": model, "day": day, **buckets[model][day]}
+                rows.append(row)
+    elif by_model:
+        for model in sorted(buckets.keys()):
+            agg = {"requests": 0, "cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
+            for day_stats in buckets[model].values():
+                for k in agg:
+                    agg[k] += day_stats[k]
+            rows.append({"model": model, **agg})
+    elif by_day:
+        day_agg: Dict[str, Dict[str, Any]] = {}
+        for model, days in buckets.items():
+            for day, stats in days.items():
+                if day not in day_agg:
+                    day_agg[day] = {"requests": 0, "cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
+                for k in day_agg[day]:
+                    day_agg[day][k] += stats[k]
+        for day in sorted(day_agg.keys()):
+            rows.append({"day": day, **day_agg[day]})
+    else:
+        rows = [{"total": True, "requests": len(entries),
+                 "cost": sum(_safe_float(e.get("cost")) or 0.0 for e in entries)}]
+
+    # Anomaly detection: flag any model whose daily spend > 2× its 7-day average
+    anomalies: List[Dict[str, Any]] = []
+    for model, days in buckets.items():
+        daily_costs = sorted(days.items())
+        if len(daily_costs) < 2:
+            continue
+        # Use last 7 days for average
+        recent = [c["cost"] for _, c in daily_costs[-7:]]
+        avg = sum(recent) / len(recent) if recent else 0
+        if avg > 0:
+            latest_day, latest_stats = daily_costs[-1]
+            if latest_stats["cost"] > 2 * avg:
+                anomalies.append({
+                    "model": model,
+                    "day": latest_day,
+                    "spend": round(latest_stats["cost"], 4),
+                    "avg_7d": round(avg, 4),
+                    "ratio": round(latest_stats["cost"] / avg, 1),
+                })
+
+    total_cost = sum(row.get("cost", 0) for row in rows)
+    return {"total_cost": total_cost, "breakdown": rows, "anomalies": anomalies}
+
+
+def format_cost_breakdown_text(data: Dict[str, Any]) -> str:
+    """Format cost breakdown as human-readable text."""
+    lines: List[str] = []
+    lines.append("NadirClaw Cost Breakdown")
+    lines.append("=" * 60)
+
+    rows = data.get("breakdown", [])
+    if not rows:
+        lines.append("No data.")
+        return "\n".join(lines)
+
+    # Determine columns
+    has_model = any("model" in r for r in rows)
+    has_day = any("day" in r for r in rows)
+
+    if has_model and has_day:
+        lines.append(f"  {'Model':30s} {'Day':12s} {'Reqs':>6}  {'Cost':>10}")
+        lines.append(f"  {'─' * 30} {'─' * 12} {'─' * 6}  {'─' * 10}")
+        for r in rows:
+            lines.append(f"  {r['model']:30s} {r['day']:12s} {r['requests']:>6}  ${r['cost']:.4f}")
+    elif has_model:
+        lines.append(f"  {'Model':35s} {'Reqs':>6}  {'Cost':>10}")
+        lines.append(f"  {'─' * 35} {'─' * 6}  {'─' * 10}")
+        for r in sorted(rows, key=lambda x: x.get("cost", 0), reverse=True):
+            lines.append(f"  {r['model']:35s} {r['requests']:>6}  ${r['cost']:.4f}")
+    elif has_day:
+        lines.append(f"  {'Day':12s} {'Reqs':>6}  {'Cost':>10}")
+        lines.append(f"  {'─' * 12} {'─' * 6}  {'─' * 10}")
+        for r in rows:
+            lines.append(f"  {r['day']:12s} {r['requests']:>6}  ${r['cost']:.4f}")
+
+    total_cost = data.get("total_cost", 0)
+    lines.append(f"\n  Total: ${total_cost:.4f}")
+
+    anomalies = data.get("anomalies", [])
+    if anomalies:
+        lines.append("")
+        lines.append("⚠ Cost Anomalies")
+        lines.append("-" * 60)
+        for a in anomalies:
+            lines.append(
+                f"  {a['model']:30s} {a['day']}: ${a['spend']:.4f} "
+                f"({a['ratio']}× vs 7d avg ${a['avg_7d']:.4f})"
+            )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

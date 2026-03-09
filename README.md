@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  Works with <strong>Claude Code</strong> · <strong>Cursor</strong> · <strong>Aider</strong> · <strong>Windsurf</strong> · <strong>Codex</strong> · <strong>OpenClaw</strong> · <strong>Open WebUI</strong> · Any OpenAI-compatible client
+  Works with <strong>Claude Code</strong> · <strong>Cursor</strong> · <strong>Continue</strong> · <strong>Aider</strong> · <strong>Windsurf</strong> · <strong>Codex</strong> · <strong>OpenClaw</strong> · <strong>Open WebUI</strong> · Any OpenAI-compatible client
 </p>
 
 <p align="center">
@@ -84,6 +84,7 @@ That's it. NadirClaw starts on `http://localhost:8856` with sensible defaults (G
 ## Features
 
 - **Smart routing** — classifies prompts in ~10ms using sentence embeddings
+- **Three-tier routing** — simple / mid / complex tiers with configurable score thresholds (`NADIRCLAW_TIER_THRESHOLDS`); set `NADIRCLAW_MID_MODEL` for a cost-effective middle tier
 - **Agentic task detection** — auto-detects tool use, multi-step loops, and agent system prompts; forces complex model for agentic requests
 - **Reasoning detection** — identifies prompts needing chain-of-thought and routes to reasoning-optimized models
 - **Vision routing** — auto-detects image content in messages and routes to vision-capable models (GPT-4o, Claude, Gemini)
@@ -97,7 +98,8 @@ That's it. NadirClaw starts on `http://localhost:8856` with sensible defaults (G
 - **OAuth login** — use your subscription with `nadirclaw auth <provider> login` (OpenAI, Anthropic, Google), no API key needed
 - **Multi-provider** — supports Gemini, OpenAI, Anthropic, Ollama, and any LiteLLM-supported provider
 - **OpenAI-compatible API** — drop-in replacement for any tool that speaks the OpenAI chat completions API
-- **Request reporting** — `nadirclaw report` analyzes your JSONL logs with filters, latency stats, tier breakdown, and token usage
+- **Request reporting** — `nadirclaw report` with per-model and per-day cost breakdown (`--by-model --by-day`), anomaly flagging, filters, latency stats, tier breakdown, and token usage
+- **Log export** — `nadirclaw export --format csv|jsonl --since 7d` for offline analysis in spreadsheets or data tools
 - **Raw logging** — optional `--log-raw` flag to capture full request/response content for debugging and replay
 - **Prometheus metrics** — built-in `/metrics` endpoint with request counts, latency histograms, token/cost totals, cache hits, and fallback tracking (zero extra dependencies)
 - **OpenTelemetry tracing** — optional distributed tracing with GenAI semantic conventions (`pip install nadirclaw[telemetry]`)
@@ -524,6 +526,28 @@ nadirclaw openwebui onboard
 
 Open WebUI will auto-discover NadirClaw's available models (`auto`, `eco`, `premium`, plus your configured tier models). The `auto` model routes each prompt to the right model automatically — simple prompts go to cheap models, complex ones to premium.
 
+## Usage with Continue
+
+[Continue](https://continue.dev) is an open-source AI coding assistant for VS Code and JetBrains. NadirClaw can be added as a model provider:
+
+```bash
+# Auto-configure Continue
+nadirclaw continue onboard
+```
+
+This writes a `~/.continue/config.json` entry with NadirClaw's `auto` model. Just start the server, open Continue in your editor, and select "NadirClaw Auto" from the model dropdown.
+
+## Usage with Cursor
+
+[Cursor](https://cursor.sh) supports OpenAI-compatible providers natively:
+
+```bash
+# View setup instructions
+nadirclaw cursor onboard
+```
+
+In Cursor: **Settings** → **Models** → **OpenAI API Key** → enter `local` as the API key and `http://localhost:8856/v1` as the base URL, with model name `auto`.
+
 ## Usage with Any OpenAI-Compatible Tool
 
 NadirClaw exposes a standard OpenAI-compatible API. Point any tool at it:
@@ -673,6 +697,11 @@ nadirclaw classify <prompt>  # Classify a prompt (no server needed)
 nadirclaw classify --format json <prompt>  # Machine-readable JSON output
 nadirclaw report             # Show a summary report of request logs
 nadirclaw report --since 24h # Report for the last 24 hours
+nadirclaw report --by-model  # Per-model cost breakdown with anomaly detection
+nadirclaw report --by-day    # Per-day cost breakdown
+nadirclaw report --by-model --by-day  # Combined model × day breakdown
+nadirclaw export --format csv --since 7d  # Export logs to CSV for offline analysis
+nadirclaw export --format jsonl -o data.jsonl  # Export to JSONL file
 nadirclaw savings            # Show how much money NadirClaw saved you
 nadirclaw savings --since 7d # Savings for the last 7 days
 nadirclaw dashboard          # Live terminal dashboard with real-time stats
@@ -692,6 +721,8 @@ nadirclaw auth gemini logout      # Remove stored Gemini OAuth credential
 nadirclaw codex onboard         # Configure Codex integration
 nadirclaw openclaw onboard   # Configure OpenClaw integration
 nadirclaw openwebui onboard  # Show Open WebUI setup instructions
+nadirclaw continue onboard   # Configure Continue (continue.dev) integration
+nadirclaw cursor onboard     # Show Cursor editor setup instructions
 nadirclaw build-centroids    # Regenerate centroid vectors from prototypes
 ```
 
@@ -724,6 +755,9 @@ nadirclaw report --since 24h         # last 24 hours
 nadirclaw report --since 7d          # last 7 days
 nadirclaw report --since 2025-02-01  # since a specific date
 nadirclaw report --model gemini      # filter by model name
+nadirclaw report --by-model          # per-model cost breakdown
+nadirclaw report --by-day            # per-day cost breakdown
+nadirclaw report --by-model --by-day # combined breakdown with anomaly detection
 nadirclaw report --format json       # machine-readable JSON output
 nadirclaw report --export report.txt # save to file
 ```
@@ -1027,6 +1061,8 @@ Auth is disabled by default (local-only). Set `NADIRCLAW_AUTH_TOKEN` to require 
 |---|---|---|
 | `NADIRCLAW_SIMPLE_MODEL` | `gemini-3-flash-preview` | Model for simple prompts |
 | `NADIRCLAW_COMPLEX_MODEL` | `openai-codex/gpt-5.3-codex` | Model for complex prompts |
+| `NADIRCLAW_MID_MODEL` | *(falls back to simple)* | Model for mid-complexity prompts (enables 3-tier routing) |
+| `NADIRCLAW_TIER_THRESHOLDS` | `0.35,0.65` | Score thresholds for 3-tier routing: `simple_max,complex_min` |
 | `NADIRCLAW_REASONING_MODEL` | *(falls back to complex)* | Model for reasoning tasks |
 | `NADIRCLAW_FREE_MODEL` | *(falls back to simple)* | Free fallback model |
 | `NADIRCLAW_FALLBACK_CHAIN` | *(all tier models)* | Comma-separated cascade order on model failure |

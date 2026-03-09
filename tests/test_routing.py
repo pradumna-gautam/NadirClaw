@@ -546,3 +546,161 @@ class TestVisionModifier:
         )
         assert model == "deepseek/deepseek-chat"
         assert not any("vision_swap" in m for m in info["modifiers_applied"])
+
+
+# ---------------------------------------------------------------------------
+# Three-tier classifier (mid tier)
+# ---------------------------------------------------------------------------
+
+class TestThreeTierClassifier:
+    def test_score_to_tier_binary_low(self):
+        """Low score → simple tier (binary mode, no mid model)."""
+        from nadirclaw.classifier import BinaryComplexityClassifier
+        tier_name, tier_num = BinaryComplexityClassifier._score_to_tier(0.2)
+        assert tier_name == "simple"
+        assert tier_num == 1
+
+    def test_score_to_tier_binary_high(self):
+        """High score → complex tier (binary mode, no mid model)."""
+        from nadirclaw.classifier import BinaryComplexityClassifier
+        tier_name, tier_num = BinaryComplexityClassifier._score_to_tier(0.8)
+        assert tier_name == "complex"
+        assert tier_num == 3
+
+    def test_score_to_tier_mid_with_env(self, monkeypatch):
+        """Mid score → mid tier when MID_MODEL is configured."""
+        monkeypatch.setenv("NADIRCLAW_MID_MODEL", "gpt-4.1-mini")
+        from nadirclaw.classifier import BinaryComplexityClassifier
+        tier_name, tier_num = BinaryComplexityClassifier._score_to_tier(0.5)
+        assert tier_name == "mid"
+        assert tier_num == 2
+
+    def test_score_to_tier_custom_thresholds(self, monkeypatch):
+        """Custom thresholds shift tier boundaries."""
+        monkeypatch.setenv("NADIRCLAW_MID_MODEL", "gpt-4.1-mini")
+        monkeypatch.setenv("NADIRCLAW_TIER_THRESHOLDS", "0.25,0.75")
+        from nadirclaw.classifier import BinaryComplexityClassifier
+        # 0.30 is above 0.25 (simple_max) and below 0.75 (complex_min) → mid
+        tier_name, _ = BinaryComplexityClassifier._score_to_tier(0.30)
+        assert tier_name == "mid"
+        # 0.20 is below 0.25 → simple
+        tier_name, _ = BinaryComplexityClassifier._score_to_tier(0.20)
+        assert tier_name == "simple"
+        # 0.80 is above 0.75 → complex
+        tier_name, _ = BinaryComplexityClassifier._score_to_tier(0.80)
+        assert tier_name == "complex"
+
+    def test_select_model_by_tier_mid(self, monkeypatch):
+        """Mid tier selects MID_MODEL."""
+        monkeypatch.setenv("NADIRCLAW_MID_MODEL", "gpt-4.1-mini")
+        from nadirclaw.classifier import BinaryComplexityClassifier
+        model, provider = BinaryComplexityClassifier._select_model_by_tier("mid")
+        assert model == "gpt-4.1-mini"
+
+
+# ---------------------------------------------------------------------------
+# Cost breakdown
+# ---------------------------------------------------------------------------
+
+class TestCostBreakdown:
+    def test_by_model(self):
+        from nadirclaw.report import generate_cost_breakdown
+        entries = [
+            {"selected_model": "gpt-4o", "timestamp": "2026-03-08T10:00:00", "cost": 0.01, "prompt_tokens": 100, "completion_tokens": 50},
+            {"selected_model": "gpt-4o", "timestamp": "2026-03-08T11:00:00", "cost": 0.02, "prompt_tokens": 200, "completion_tokens": 100},
+            {"selected_model": "gemini-flash", "timestamp": "2026-03-08T12:00:00", "cost": 0.001, "prompt_tokens": 100, "completion_tokens": 50},
+        ]
+        result = generate_cost_breakdown(entries, by_model=True)
+        assert len(result["breakdown"]) == 2
+        models = {r["model"] for r in result["breakdown"]}
+        assert "gpt-4o" in models
+        assert "gemini-flash" in models
+
+    def test_by_day(self):
+        from nadirclaw.report import generate_cost_breakdown
+        entries = [
+            {"selected_model": "gpt-4o", "timestamp": "2026-03-07T10:00:00", "cost": 0.01, "prompt_tokens": 100, "completion_tokens": 50},
+            {"selected_model": "gpt-4o", "timestamp": "2026-03-08T11:00:00", "cost": 0.02, "prompt_tokens": 200, "completion_tokens": 100},
+        ]
+        result = generate_cost_breakdown(entries, by_day=True)
+        assert len(result["breakdown"]) == 2
+        days = {r["day"] for r in result["breakdown"]}
+        assert "2026-03-07" in days
+        assert "2026-03-08" in days
+
+    def test_by_model_and_day(self):
+        from nadirclaw.report import generate_cost_breakdown
+        entries = [
+            {"selected_model": "gpt-4o", "timestamp": "2026-03-07T10:00:00", "cost": 0.01, "prompt_tokens": 100, "completion_tokens": 50},
+            {"selected_model": "gemini-flash", "timestamp": "2026-03-07T11:00:00", "cost": 0.001, "prompt_tokens": 50, "completion_tokens": 25},
+            {"selected_model": "gpt-4o", "timestamp": "2026-03-08T10:00:00", "cost": 0.02, "prompt_tokens": 200, "completion_tokens": 100},
+        ]
+        result = generate_cost_breakdown(entries, by_model=True, by_day=True)
+        assert len(result["breakdown"]) == 3
+
+    def test_anomaly_detection(self):
+        from nadirclaw.report import generate_cost_breakdown
+        # Create entries where the latest day spikes
+        entries = []
+        for day in range(1, 8):
+            entries.append({
+                "selected_model": "gpt-4o",
+                "timestamp": f"2026-03-{day:02d}T10:00:00",
+                "cost": 0.01,
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+            })
+        # Big spike on day 8
+        entries.append({
+            "selected_model": "gpt-4o",
+            "timestamp": "2026-03-08T10:00:00",
+            "cost": 0.10,  # 10× normal
+            "prompt_tokens": 1000,
+            "completion_tokens": 500,
+        })
+        result = generate_cost_breakdown(entries, by_model=True, by_day=True)
+        assert len(result["anomalies"]) >= 1
+        assert result["anomalies"][0]["model"] == "gpt-4o"
+
+    def test_empty_entries(self):
+        from nadirclaw.report import generate_cost_breakdown
+        result = generate_cost_breakdown([])
+        assert result["total_cost"] == 0
+        assert result["breakdown"] == []
+
+
+# ---------------------------------------------------------------------------
+# Settings: mid tier and tier thresholds
+# ---------------------------------------------------------------------------
+
+class TestSettingsMidTier:
+    def test_default_no_mid(self):
+        from nadirclaw.settings import Settings
+        s = Settings()
+        assert s.has_mid_tier is False
+
+    def test_mid_model_set(self, monkeypatch):
+        monkeypatch.setenv("NADIRCLAW_MID_MODEL", "gpt-4.1-mini")
+        from nadirclaw.settings import Settings
+        s = Settings()
+        assert s.has_mid_tier is True
+        assert s.MID_MODEL == "gpt-4.1-mini"
+
+    def test_default_thresholds(self):
+        from nadirclaw.settings import Settings
+        s = Settings()
+        assert s.TIER_THRESHOLDS == (0.35, 0.65)
+
+    def test_custom_thresholds(self, monkeypatch):
+        monkeypatch.setenv("NADIRCLAW_TIER_THRESHOLDS", "0.25,0.75")
+        from nadirclaw.settings import Settings
+        s = Settings()
+        assert s.TIER_THRESHOLDS == (0.25, 0.75)
+
+    def test_tier_models_with_mid(self, monkeypatch):
+        monkeypatch.setenv("NADIRCLAW_MID_MODEL", "gpt-4.1-mini")
+        monkeypatch.setenv("NADIRCLAW_SIMPLE_MODEL", "gemini-2.5-flash")
+        monkeypatch.setenv("NADIRCLAW_COMPLEX_MODEL", "gpt-4o")
+        from nadirclaw.settings import Settings
+        s = Settings()
+        assert "gpt-4.1-mini" in s.tier_models
