@@ -2,6 +2,24 @@
 
 All notable changes to NadirClaw will be documented in this file.
 
+## [0.13.0] - 2026-03-20
+
+### Added
+- **Context Optimize** — new preprocessing stage that compacts bloated context before LLM dispatch, reducing input token cost by 30-70%. Two modes:
+  - **`safe`** — five deterministic, lossless transforms: JSON minification, whitespace normalization, system prompt dedup, tool schema dedup, chat history trimming.
+  - **`aggressive`** — all safe transforms + diff-preserving semantic deduplication. Uses sentence embeddings (`all-MiniLM-L6-v2`) to detect near-duplicate messages (cosine similarity >= 0.85), then extracts only the unique diff phrases using `difflib.SequenceMatcher`. Refinements survive dedup — "return values, not indices" is preserved even when 90% similar to an earlier message.
+- **Accurate token counting with tiktoken** — uses `cl100k_base` BPE tokenizer instead of `len//4` heuristic. Falls back gracefully if tiktoken is not installed.
+- **Shared sentence encoder** — lazy-loaded `SentenceTransformer` singleton in `nadirclaw/encoder.py` for aggressive mode. No import cost when using safe mode or off.
+- **`nadirclaw optimize` command** — dry-run CLI tool to test context compaction on files or stdin. Supports `--mode safe|aggressive` and `--format text|json`.
+- **`--optimize` flag on `nadirclaw serve`** — set optimization mode at startup (`off`, `safe`, `aggressive`).
+- **Per-request `optimize` override** — pass `"optimize": "safe"` in the request body to override the server default for individual requests.
+- **Optimization metrics** — `tokens_saved`, `original_tokens`, `optimized_tokens`, and `optimizations_applied` logged per request in JSONL, SQLite, and Prometheus. Web dashboard shows aggregate savings.
+- New env vars: `NADIRCLAW_OPTIMIZE` (default: `off`), `NADIRCLAW_OPTIMIZE_MAX_TURNS` (default: `40`).
+- 60 automated tests covering safe transforms, aggressive semantic dedup, accuracy preservation, edge cases, and roundtrip integrity.
+
+### Changed
+- SQLite schema: added columns `optimization_mode`, `original_tokens`, `optimized_tokens`, `tokens_saved`, `optimizations_applied` (auto-migrated on startup).
+
 ## [0.7.0] - 2026-03-02
 
 ### Added

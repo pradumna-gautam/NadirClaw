@@ -73,6 +73,8 @@ cost_total = _Counter()              # labels: (model,)
 cache_hits_total = _Counter()        # labels: ()
 fallbacks_total = _Counter()         # labels: (from_model, to_model)
 errors_total = _Counter()            # labels: (model, error_type)
+tokens_saved_total = _Counter()      # labels: (optimization_mode,)
+optimizations_total = _Counter()     # labels: (optimization_name,)
 
 # Histograms
 latency_ms = _Histogram(LATENCY_BUCKETS)  # labels: (model, tier)
@@ -124,6 +126,14 @@ def record_request(entry: Dict[str, Any]) -> None:
     # Error
     if status != "ok":
         errors_total.inc((model, status))
+
+    # Optimization
+    saved = entry.get("tokens_saved", 0) or 0
+    if saved > 0:
+        opt_mode = entry.get("optimization_mode", "unknown")
+        tokens_saved_total.inc((opt_mode,), saved)
+        for opt_name in entry.get("optimizations_applied") or []:
+            optimizations_total.inc((opt_name,))
 
 
 def render_metrics() -> str:
@@ -188,6 +198,18 @@ def render_metrics() -> str:
         )
         lines.append(f'nadirclaw_request_latency_ms_sum{{model="{model}",tier="{tier}"}} {s:.1f}')
         lines.append(f'nadirclaw_request_latency_ms_count{{model="{model}",tier="{tier}"}} {count}')
+
+    # -- nadirclaw_tokens_saved_total --
+    lines.append("# HELP nadirclaw_tokens_saved_total Total tokens saved by context optimization.")
+    lines.append("# TYPE nadirclaw_tokens_saved_total counter")
+    for (opt_mode,), val in tokens_saved_total.items():
+        lines.append(f'nadirclaw_tokens_saved_total{{mode="{opt_mode}"}} {int(val)}')
+
+    # -- nadirclaw_optimizations_total --
+    lines.append("# HELP nadirclaw_optimizations_total Total optimization transform applications.")
+    lines.append("# TYPE nadirclaw_optimizations_total counter")
+    for (opt_name,), val in optimizations_total.items():
+        lines.append(f'nadirclaw_optimizations_total{{transform="{opt_name}"}} {int(val)}')
 
     # -- nadirclaw_uptime_seconds --
     lines.append("# HELP nadirclaw_uptime_seconds Seconds since NadirClaw started.")

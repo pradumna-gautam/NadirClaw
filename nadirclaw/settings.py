@@ -196,6 +196,27 @@ class Settings:
             return 0
 
     @property
+    def OPTIMIZE(self) -> str:
+        """Context optimization mode: off, safe, aggressive. Default: off."""
+        val = os.getenv("NADIRCLAW_OPTIMIZE", "off").lower()
+        if val not in ("off", "safe", "aggressive"):
+            _settings_logger.warning(
+                "Invalid NADIRCLAW_OPTIMIZE=%r — expected off|safe|aggressive. "
+                "Falling back to 'off'.",
+                val,
+            )
+            return "off"
+        return val
+
+    @property
+    def OPTIMIZE_MAX_TURNS(self) -> int:
+        """Max conversation turns to keep when trimming. Default: 40."""
+        try:
+            return max(4, int(os.getenv("NADIRCLAW_OPTIMIZE_MAX_TURNS", "40")))
+        except ValueError:
+            return 40
+
+    @property
     def has_explicit_tiers(self) -> bool:
         """True if SIMPLE_MODEL and COMPLEX_MODEL are explicitly set via env."""
         return bool(

@@ -83,6 +83,7 @@ That's it. NadirClaw starts on `http://localhost:8856` with sensible defaults (G
 
 ## Features
 
+- **Context Optimize** — compacts bloated context (JSON, tool schemas, chat history, whitespace) before dispatch, saving 30-70% input tokens with zero semantic loss. Modes: `off` (default), `safe` (lossless), `aggressive` (future). See [savings analysis](docs/context-optimize-savings.md)
 - **Smart routing** — classifies prompts in ~10ms using sentence embeddings
 - **Three-tier routing** — simple / mid / complex tiers with configurable score thresholds (`NADIRCLAW_TIER_THRESHOLDS`); set `NADIRCLAW_MID_MODEL` for a cost-effective middle tier
 - **Agentic task detection** — auto-detects tool use, multi-step loops, and agent system prompts; forces complex model for agentic requests
@@ -693,6 +694,7 @@ nadirclaw setup              # Interactive setup wizard (providers, keys, models
 nadirclaw serve              # Start the router server
 nadirclaw serve --log-raw    # Start with full request/response logging
 nadirclaw test               # Probe each configured model and verify it responds
+nadirclaw optimize <file>    # Test context compaction on a file (dry-run)
 nadirclaw classify <prompt>  # Classify a prompt (no server needed)
 nadirclaw classify --format json <prompt>  # Machine-readable JSON output
 nadirclaw report             # Show a summary report of request logs
@@ -737,8 +739,31 @@ Options:
   --complex-model TEXT    Model for complex prompts
   --models TEXT           Comma-separated model list (legacy)
   --token TEXT            Auth token
+  --optimize [off|safe|aggressive]  Context optimization mode (default: off)
   --verbose               Enable debug logging
   --log-raw               Log full raw requests and responses to JSONL
+```
+
+### `nadirclaw optimize`
+
+Test context compaction on a file or stdin without running the server:
+
+```bash
+nadirclaw optimize payload.json                    # dry-run with safe mode
+nadirclaw optimize payload.json --format json      # machine-readable output
+nadirclaw optimize payload.json --mode aggressive   # aggressive mode (future)
+cat messages.json | nadirclaw optimize             # pipe from stdin
+```
+
+Input can be a JSON file with a `messages` array (OpenAI format), a raw JSON array of messages, or plain text (wrapped as a single user message).
+
+Example output:
+```
+Mode:          safe
+Original:      ~3,657 tokens
+Optimized:     ~1,573 tokens
+Saved:         ~2,084 tokens (57.0%)
+Transforms:    tool_schema_dedup, json_minify, whitespace_normalize
 ```
 
 ### `nadirclaw report`
@@ -1040,6 +1065,20 @@ If you currently spend $100/month on Claude API:
 
 **Use `nadirclaw report` and `nadirclaw savings` to see your actual numbers.**
 
+### Context Optimize Savings
+
+On top of routing savings, Context Optimize compacts bloated payloads before they hit the provider. Benchmarked on Claude Opus 4.6 ($15/1M input tokens):
+
+| Payload Type | Tokens Saved | Savings % | Saved / 1K req |
+|---|---:|---:|---:|
+| Agentic assistant (8 turns, 5 tool schemas repeated) | 2,084 | 57% | $31.26 |
+| RAG pipeline (6 chunks, pretty-printed JSON) | 158 | 29% | $2.37 |
+| API response analysis (nested JSON) | 1,018 | 62% | $15.27 |
+| Long debug session (50 turns + JSON logs) | 2,442 | 63% | $36.63 |
+| OpenAPI spec context (5 endpoints) | 1,887 | 71% | $28.30 |
+
+Average: **61.5% input token reduction** across structured payloads. Enable with `--optimize safe`. See [full analysis](docs/context-optimize-savings.md).
+
 ## API Endpoints
 
 Auth is disabled by default (local-only). Set `NADIRCLAW_AUTH_TOKEN` to require a bearer token.
@@ -1082,6 +1121,8 @@ Auth is disabled by default (local-only). Set `NADIRCLAW_AUTH_TOKEN` to require 
 | `NADIRCLAW_CONFIDENCE_THRESHOLD` | `0.06` | Classification threshold (lower = more complex) |
 | `NADIRCLAW_PORT` | `8856` | Server port |
 | `NADIRCLAW_LOG_DIR` | `~/.nadirclaw/logs` | Log directory |
+| `NADIRCLAW_OPTIMIZE` | `off` | Context optimization mode: `off`, `safe` (lossless), `aggressive` (future) |
+| `NADIRCLAW_OPTIMIZE_MAX_TURNS` | `40` | Max conversation turns to keep when trimming history |
 | `NADIRCLAW_LOG_RAW` | `false` | Log full raw requests and responses (`true`/`false`) |
 | `NADIRCLAW_MODELS` | `openai-codex/gpt-5.3-codex,gemini-3-flash-preview` | Legacy model list (fallback if tier vars not set) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | *(empty — disabled)* | OpenTelemetry collector endpoint (enables tracing) |

@@ -88,6 +88,7 @@ async def dashboard_stats(
             "cost": e.get("cost", 0),
             "prompt": (e.get("prompt", "") or "")[:60],
             "fallback": e.get("fallback_used"),
+            "tokens_saved": e.get("tokens_saved", 0) or 0,
         })
 
     # Budget
@@ -95,6 +96,12 @@ async def dashboard_stats(
 
     # Fallback stats
     fallbacks = sum(1 for e in completions if e.get("fallback_used"))
+
+    # Optimization stats
+    total_tokens_saved = sum(e.get("tokens_saved", 0) or 0 for e in completions)
+    total_original_tokens = sum(e.get("original_tokens", 0) or 0 for e in completions if e.get("original_tokens"))
+    opt_savings_pct = (total_tokens_saved / max(total_original_tokens, 1) * 100) if total_original_tokens else 0
+    optimized_requests = sum(1 for e in completions if e.get("optimization_mode") and e.get("optimization_mode") != "off")
 
     return {
         "total_requests": len(completions),
@@ -105,6 +112,11 @@ async def dashboard_stats(
         "fallback_count": fallbacks,
         "simple_model": settings.SIMPLE_MODEL,
         "complex_model": settings.COMPLEX_MODEL,
+        "optimization": {
+            "total_tokens_saved": total_tokens_saved,
+            "savings_pct": round(opt_savings_pct, 1),
+            "optimized_requests": optimized_requests,
+        },
     }
 
 

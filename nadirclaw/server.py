@@ -290,6 +290,8 @@ async def startup():
             logger.info("Tier config:   3-tier (thresholds: %.2f / %.2f)", thresholds[0], thresholds[1])
         else:
             logger.info("Tier config:   derived from NADIRCLAW_MODELS")
+        if settings.OPTIMIZE != "off":
+            logger.info("Optimize:      %s", settings.OPTIMIZE)
         logger.info("Ollama base:   %s", settings.OLLAMA_API_BASE)
         if settings.API_BASE:
             logger.info("API base:      %s", settings.API_BASE)
@@ -1081,6 +1083,37 @@ async def chat_completions(
                 # Cache this decision for session persistence
                 session_cache.put(request.messages, selected_model, final_tier)
 
+        # ------------------------------------------------------------------
+        # Context optimization — compact messages before dispatch
+        # ------------------------------------------------------------------
+        optimize_mode = (request.model_extra or {}).get("optimize") or settings.OPTIMIZE
+        optimization_info = None
+        if optimize_mode != "off":
+            from nadirclaw.optimize import optimize_messages
+
+            raw_msgs = [
+                {"role": m.role, "content": m.text_content()}
+                for m in request.messages
+            ]
+            opt_result = optimize_messages(
+                raw_msgs,
+                mode=optimize_mode,
+                max_turns=settings.OPTIMIZE_MAX_TURNS,
+            )
+            if opt_result.tokens_saved > 0:
+                optimized_msgs = [
+                    ChatMessage(role=m["role"], content=m["content"])
+                    for m in opt_result.messages
+                ]
+                request = request.model_copy(update={"messages": optimized_msgs})
+            optimization_info = {
+                "optimization_mode": opt_result.mode,
+                "original_tokens": opt_result.original_tokens,
+                "optimized_tokens": opt_result.optimized_tokens,
+                "tokens_saved": opt_result.tokens_saved,
+                "optimizations_applied": opt_result.optimizations_applied,
+            }
+
         # Resolve provider credential
         from nadirclaw.credentials import detect_provider, get_credential
 
@@ -1149,6 +1182,7 @@ async def chat_completions(
                     "streaming": True,
                     "status": "error" if _stream_analysis.get("_stream_error") else "ok",
                     **_stream_req_meta,
+                    **(optimization_info or {}),
                 })
 
             return EventSourceResponse(
@@ -1218,6 +1252,7 @@ async def chat_completions(
             "fallback_used": analysis_info.get("fallback_from"),
             "status": "ok",
             **req_meta,
+            **(optimization_info or {}),
         }
 
         if settings.LOG_RAW:
@@ -1270,6 +1305,7 @@ async def chat_completions(
                 "request_id": request_id,
                 "response_time_ms": elapsed_ms,
                 "routing": analysis_info,
+                **({"optimization": optimization_info} if optimization_info else {}),
             },
         }
 

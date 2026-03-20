@@ -4,6 +4,7 @@ SQLite-based request logging for NadirClaw.
 Logs every API call with timestamp, model, tokens, cost, latency to a local SQLite database.
 """
 
+import json
 import logging
 import sqlite3
 from datetime import datetime, timezone
@@ -85,6 +86,19 @@ def _init_db() -> None:
                 ON requests(status)
             """)
             
+            # Migrate: add optimization columns (idempotent)
+            for col, col_type in [
+                ("optimization_mode", "TEXT"),
+                ("original_tokens", "INTEGER"),
+                ("optimized_tokens", "INTEGER"),
+                ("tokens_saved", "INTEGER"),
+                ("optimizations_applied", "TEXT"),
+            ]:
+                try:
+                    cursor.execute(f"ALTER TABLE requests ADD COLUMN {col} {col_type}")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+
             conn.commit()
             _db_initialized = True
             logger.debug("SQLite request log initialized at %s", db_path)
@@ -132,7 +146,16 @@ def log_request(entry: Dict[str, Any]) -> None:
     has_images = 1 if entry.get("has_images") else 0
     has_tools = 1 if entry.get("has_tools") else 0
     max_context_tokens = entry.get("max_context_tokens")
-    
+    optimization_mode = entry.get("optimization_mode")
+    original_tokens = entry.get("original_tokens")
+    optimized_tokens = entry.get("optimized_tokens")
+    tokens_saved = entry.get("tokens_saved")
+    optimizations_applied = (
+        json.dumps(entry["optimizations_applied"])
+        if entry.get("optimizations_applied")
+        else None
+    )
+
     with _db_lock:
         conn = sqlite3.connect(str(db_path))
         try:
@@ -143,14 +166,18 @@ def log_request(entry: Dict[str, Any]) -> None:
                     provider, tier, confidence, complexity_score, classifier_latency_ms,
                     total_latency_ms, prompt_tokens, completion_tokens, total_tokens,
                     cost, daily_spend, response_preview, fallback_used, error,
-                    tool_count, has_images, has_tools, max_context_tokens
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    tool_count, has_images, has_tools, max_context_tokens,
+                    optimization_mode, original_tokens, optimized_tokens,
+                    tokens_saved, optimizations_applied
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 timestamp, request_id, req_type, status, prompt, selected_model,
                 provider, tier, confidence, complexity_score, classifier_latency_ms,
                 total_latency_ms, prompt_tokens, completion_tokens, total_tokens,
                 cost, daily_spend, response_preview, fallback_used, error,
-                tool_count, has_images, has_tools, max_context_tokens
+                tool_count, has_images, has_tools, max_context_tokens,
+                optimization_mode, original_tokens, optimized_tokens,
+                tokens_saved, optimizations_applied,
             ))
             conn.commit()
         except Exception as e:

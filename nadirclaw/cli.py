@@ -37,7 +37,9 @@ def setup(reconfigure):
 @click.option("--token", default=None, help="Auth token")
 @click.option("--verbose", is_flag=True, help="Enable verbose logging")
 @click.option("--log-raw", is_flag=True, help="Log full raw requests and responses to JSONL")
-def serve(port, simple_model, complex_model, models, token, verbose, log_raw):
+@click.option("--optimize", default=None, type=click.Choice(["off", "safe", "aggressive"]),
+              help="Context optimization mode (default: off)")
+def serve(port, simple_model, complex_model, models, token, verbose, log_raw, optimize):
     """Start the NadirClaw router server."""
     import logging
 
@@ -63,6 +65,8 @@ def serve(port, simple_model, complex_model, models, token, verbose, log_raw):
         os.environ["NADIRCLAW_AUTH_TOKEN"] = token
     if log_raw:
         os.environ["NADIRCLAW_LOG_RAW"] = "true"
+    if optimize:
+        os.environ["NADIRCLAW_OPTIMIZE"] = optimize
 
     log_level = "debug" if verbose else "info"
     logging.basicConfig(
@@ -79,6 +83,8 @@ def serve(port, simple_model, complex_model, models, token, verbose, log_raw):
     click.echo(f"Starting NadirClaw on port {actual_port}...")
     click.echo(f"  Simple model:  {settings.SIMPLE_MODEL}")
     click.echo(f"  Complex model: {settings.COMPLEX_MODEL}")
+    if settings.OPTIMIZE != "off":
+        click.echo(f"  Optimize:      {settings.OPTIMIZE}")
     uvicorn.run(
         "nadirclaw.server:app",
         host="0.0.0.0",
@@ -123,6 +129,62 @@ def classify(prompt, fmt):
         click.echo(f"Confidence: {confidence:.4f}")
         click.echo(f"Score:      {score:.4f}")
         click.echo(f"Model:      {model}")
+
+
+@main.command("optimize")
+@click.argument("file", type=click.Path(exists=True), required=False)
+@click.option("--mode", default="safe", type=click.Choice(["safe", "aggressive"]),
+              help="Optimization mode")
+@click.option("--format", "fmt", default="text", type=click.Choice(["text", "json"]),
+              help="Output format")
+def optimize_cmd(file, mode, fmt):
+    """Test context optimization on a file (or stdin). Dry-run — shows before/after."""
+    import sys
+
+    from nadirclaw.optimize import optimize_messages
+
+    if file:
+        with open(file) as f:
+            content = f.read()
+    else:
+        if sys.stdin.isatty():
+            click.echo("Reading from stdin (Ctrl-D to end)...")
+        content = sys.stdin.read()
+
+    # Try to parse as JSON messages array, or wrap in a single user message
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, dict) and "messages" in parsed:
+            messages = parsed["messages"]
+        elif isinstance(parsed, list):
+            messages = parsed
+        else:
+            messages = [{"role": "user", "content": content}]
+    except json.JSONDecodeError:
+        messages = [{"role": "user", "content": content}]
+
+    result = optimize_messages(messages, mode=mode)
+
+    if fmt == "json":
+        click.echo(json.dumps({
+            "mode": result.mode,
+            "original_tokens": result.original_tokens,
+            "optimized_tokens": result.optimized_tokens,
+            "tokens_saved": result.tokens_saved,
+            "savings_pct": round(result.tokens_saved / max(result.original_tokens, 1) * 100, 1),
+            "optimizations_applied": result.optimizations_applied,
+            "messages": result.messages,
+        }, indent=2))
+    else:
+        click.echo(f"Mode:          {result.mode}")
+        click.echo(f"Original:      ~{result.original_tokens} tokens")
+        click.echo(f"Optimized:     ~{result.optimized_tokens} tokens")
+        savings_pct = result.tokens_saved / max(result.original_tokens, 1) * 100
+        click.echo(f"Saved:         ~{result.tokens_saved} tokens ({savings_pct:.1f}%)")
+        if result.optimizations_applied:
+            click.echo(f"Transforms:    {', '.join(result.optimizations_applied)}")
+        else:
+            click.echo("Transforms:    (none applied)")
 
 
 @main.command()
