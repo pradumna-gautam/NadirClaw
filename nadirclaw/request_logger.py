@@ -112,7 +112,9 @@ def log_request(entry: Dict[str, Any]) -> None:
     request_id = entry.get("request_id")
     req_type = entry.get("type")
     status = entry.get("status", "ok")
-    prompt = entry.get("prompt")
+    # Truncate prompt to prevent storing sensitive system prompt content
+    _raw_prompt = entry.get("prompt")
+    prompt = _raw_prompt[:500] if isinstance(_raw_prompt, str) else _raw_prompt
     selected_model = entry.get("selected_model")
     provider = entry.get("provider")
     tier = entry.get("tier")
