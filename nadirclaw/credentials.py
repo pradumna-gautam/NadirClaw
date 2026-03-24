@@ -6,6 +6,8 @@ Supports OAuth tokens with automatic refresh for all providers.
 OpenClaw integration is optional — NadirClaw works standalone.
 """
 
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -16,6 +18,73 @@ from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger("nadirclaw")
+
+
+# ---------------------------------------------------------------------------
+# Credential encryption at rest (Fernet symmetric encryption)
+# ---------------------------------------------------------------------------
+
+def _get_encryption_key() -> Optional[bytes]:
+    """Derive a Fernet encryption key from NADIRCLAW_CREDENTIAL_KEY env var.
+
+    Returns None if no key is configured (plaintext fallback with warning).
+    """
+    raw_key = os.getenv("NADIRCLAW_CREDENTIAL_KEY", "")
+    if not raw_key:
+        return None
+    # Derive a 32-byte key from the user-provided secret via SHA-256,
+    # then base64url-encode it for Fernet compatibility.
+    derived = hashlib.sha256(raw_key.encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(derived)
+
+
+def _encrypt_json(data: dict) -> str:
+    """Encrypt a dict as a Fernet token string. Falls back to plaintext."""
+    key = _get_encryption_key()
+    if key is None:
+        return json.dumps(data, indent=2)
+    try:
+        from cryptography.fernet import Fernet
+        f = Fernet(key)
+        plaintext = json.dumps(data).encode("utf-8")
+        return f.encrypt(plaintext).decode("ascii")
+    except ImportError:
+        logger.warning(
+            "cryptography package not installed — credentials stored in plaintext. "
+            "Install with: pip install cryptography"
+        )
+        return json.dumps(data, indent=2)
+
+
+def _decrypt_json(raw: str) -> dict:
+    """Decrypt a Fernet token string back to a dict. Falls back to plain JSON."""
+    # Try plain JSON first (migration path: old plaintext files still work)
+    raw_stripped = raw.strip()
+    if raw_stripped.startswith("{"):
+        data = json.loads(raw_stripped)
+        # Auto-migrate: if encryption key is now configured, re-encrypt on next write
+        return data
+
+    # Try Fernet decryption
+    key = _get_encryption_key()
+    if key is None:
+        # No key configured but file is encrypted — cannot read
+        logger.error(
+            "Credentials file appears encrypted but NADIRCLAW_CREDENTIAL_KEY is not set. "
+            "Set the same key used during encryption to decrypt."
+        )
+        return {}
+    try:
+        from cryptography.fernet import Fernet, InvalidToken
+        f = Fernet(key)
+        plaintext = f.decrypt(raw_stripped.encode("ascii"))
+        return json.loads(plaintext)
+    except ImportError:
+        logger.error("cryptography package required to decrypt credentials")
+        return {}
+    except (InvalidToken, Exception) as e:
+        logger.error("Failed to decrypt credentials (wrong key?): %s", e)
+        return {}
 
 # Provider name → env var mapping
 _ENV_VAR_MAP = {
@@ -63,7 +132,8 @@ def _read_credentials() -> dict:
     if not path.exists():
         return {}
     try:
-        return json.loads(path.read_text())
+        raw = path.read_text()
+        return _decrypt_json(raw)
     except (json.JSONDecodeError, OSError) as e:
         logger.warning("Could not read credentials file: %s", e)
         return {}
@@ -89,7 +159,7 @@ def _write_credentials(data: dict) -> None:
         )
         try:
             with os.fdopen(fd, "w") as f:
-                f.write(json.dumps(data, indent=2) + "\n")
+                f.write(_encrypt_json(data) + "\n")
             os.replace(tmp_path, str(path))
         except Exception:
             try:

@@ -19,8 +19,10 @@ from typing import Any, Dict, List, Optional, Union
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from sse_starlette.sse import EventSourceResponse
+
+import os
 
 from nadirclaw import __version__
 from nadirclaw.auth import UserSession, validate_local_auth
@@ -91,17 +93,62 @@ app = FastAPI(
 from nadirclaw.web_dashboard import router as dashboard_router
 app.include_router(dashboard_router)
 
+# ---------------------------------------------------------------------------
+# CORS — restrict to explicit origins (never wildcard + credentials)
+# ---------------------------------------------------------------------------
+_cors_origins_raw = os.getenv("NADIRCLAW_CORS_ORIGINS", "")
+if _cors_origins_raw:
+    _cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+    _cors_credentials = True
+else:
+    # Local-only default: only localhost origins
+    _cors_origins = [
+        "http://localhost:*",
+        "http://127.0.0.1:*",
+        "https://localhost:*",
+        "https://127.0.0.1:*",
+    ]
+    _cors_credentials = False  # No credentials unless origins are explicitly configured
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_credentials,
+    allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-Request-ID"],
 )
 
 
 # ---------------------------------------------------------------------------
-# Validation error handler — log request body for debugging
+# Security headers middleware
+# ---------------------------------------------------------------------------
+from starlette.middleware.base import BaseHTTPMiddleware
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Inject security headers on every response."""
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["X-Request-ID"] = str(uuid.uuid4())
+        # Prevent caching of API responses
+        if request.url.path.startswith("/v1/"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        if os.getenv("NADIRCLAW_HSTS", "").lower() in ("1", "true", "yes"):
+            response.headers["Strict-Transport-Security"] = (
+                "max-age=31536000; includeSubDomains"
+            )
+        return response
+
+
+app.add_middleware(SecurityHeadersMiddleware)
+
+
+# ---------------------------------------------------------------------------
+# Validation error handler — sanitized responses (no Pydantic internals)
 # ---------------------------------------------------------------------------
 
 from fastapi.exceptions import RequestValidationError
@@ -110,14 +157,24 @@ from fastapi.exceptions import RequestValidationError
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     body = await request.body()
+    # Log full details server-side only
     logger.error(
-        "Validation error on %s %s: %s\nBody: %s",
+        "Validation error on %s %s: %s\nBody (truncated): %s",
         request.method,
         request.url.path,
         exc.errors(),
-        body[:2000].decode("utf-8", errors="replace"),
+        body[:500].decode("utf-8", errors="replace"),
     )
-    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+    # Return sanitized error to client — no Pydantic internals
+    safe_errors = []
+    for err in exc.errors():
+        loc = err.get("loc", [])
+        field = ".".join(str(part) for part in loc if part != "body")
+        safe_errors.append({
+            "field": field or "request",
+            "message": f"Invalid value for '{field}'" if field else "Invalid request body",
+        })
+    return JSONResponse(status_code=422, content={"detail": safe_errors})
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +210,22 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     top_p: Optional[float] = None
     stream: Optional[bool] = False
+    n: Optional[int] = None
+
+    @model_validator(mode="after")
+    def _validate_bounds(self) -> "ChatCompletionRequest":
+        """Enforce safe bounds on all numeric parameters."""
+        if len(self.messages) > 500:
+            raise ValueError("messages: max 500 messages allowed")
+        if self.temperature is not None and not (0.0 <= self.temperature <= 2.0):
+            raise ValueError("temperature: must be between 0.0 and 2.0")
+        if self.max_tokens is not None and (self.max_tokens < 1 or self.max_tokens > 100_000):
+            raise ValueError("max_tokens: must be between 1 and 100,000")
+        if self.top_p is not None and not (0.0 <= self.top_p <= 1.0):
+            raise ValueError("top_p: must be between 0.0 and 1.0")
+        if self.n is not None and (self.n < 1 or self.n > 8):
+            raise ValueError("n: must be between 1 and 8")
+        return self
 
 
 class ClassifyRequest(BaseModel):
@@ -169,10 +242,11 @@ class ClassifyBatchRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 _log_lock = Lock()
+_log_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nadirclaw-log")
 
 
-def _log_request(entry: Dict[str, Any]) -> None:
-    """Append a JSON line to the request log and print to console."""
+def _log_request_sync(entry: Dict[str, Any]) -> None:
+    """Synchronous log writer — runs in thread pool to avoid blocking the event loop."""
     log_dir = settings.LOG_DIR
     log_dir.mkdir(parents=True, exist_ok=True)
     request_log = log_dir / "requests.jsonl"
@@ -183,13 +257,19 @@ def _log_request(entry: Dict[str, Any]) -> None:
         with open(request_log, "a") as f:
             f.write(line)
 
-    # Also log to SQLite
-    from nadirclaw.request_logger import log_request as sqlite_log
-    sqlite_log(entry)
 
-    # Update Prometheus metrics
-    from nadirclaw.metrics import record_request
-    record_request(entry)
+def _log_request(entry: Dict[str, Any]) -> None:
+    """Non-blocking log request — submits all blocking I/O to thread pool."""
+    def _do_log():
+        _log_request_sync(entry)
+        # SQLite logging (also blocking I/O with threading.Lock)
+        from nadirclaw.request_logger import log_request as sqlite_log
+        sqlite_log(entry)
+        # Prometheus metrics (CPU-only, fast)
+        from nadirclaw.metrics import record_request
+        record_request(entry)
+
+    _log_executor.submit(_do_log)
 
     tier = entry.get("tier", "?")
     model = entry.get("selected_model", "?")
@@ -220,6 +300,20 @@ def _extract_request_metadata(request: ChatCompletionRequest) -> Dict[str, Any]:
 
     system_text = " ".join(m.text_content() for m in system_msgs) if has_system else ""
 
+    # Sanitize system prompt for logging: redact API key patterns, truncate
+    import re
+    _API_KEY_PATTERN = re.compile(
+        r"(sk-[a-zA-Z0-9_-]{10,}|AIza[a-zA-Z0-9_-]{20,}|ghp_[a-zA-Z0-9]{20,}"
+        r"|gho_[a-zA-Z0-9]{20,}|xox[bpars]-[a-zA-Z0-9-]{10,})"
+    )
+    _log_system_prompts = os.getenv("NADIRCLAW_LOG_SYSTEM_PROMPTS", "false").lower() in (
+        "1", "true", "yes",
+    )
+    if _log_system_prompts and system_text:
+        sanitized_system_text = _API_KEY_PATTERN.sub("[REDACTED_KEY]", system_text)[:500]
+    else:
+        sanitized_system_text = ""
+
     from nadirclaw.routing import detect_images
     image_info = detect_images(messages)
 
@@ -228,7 +322,7 @@ def _extract_request_metadata(request: ChatCompletionRequest) -> Dict[str, Any]:
         "message_count": len(messages),
         "has_system_prompt": has_system,
         "system_prompt_length": system_len,
-        "system_prompt_text": system_text,
+        "system_prompt_text": sanitized_system_text,
         "has_tools": tool_count > 0,
         "tool_count": tool_count,
         "requested_model": request.model,
@@ -929,9 +1023,17 @@ def _rate_limit_error_response(model: str) -> Dict[str, Any]:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(
+    raw_request: Request,
     request: ChatCompletionRequest,
     current_user: UserSession = Depends(validate_local_auth),
 ):
+    # --- Replay attack prevention (opt-in via X-Request-Nonce header) ---
+    from nadirclaw.replay_guard import check_nonce
+    nonce = raw_request.headers.get("x-request-nonce")
+    replay_err = check_nonce(nonce)
+    if replay_err:
+        raise HTTPException(status_code=409, detail=replay_err)
+
     # --- Rate limiting (per user) ---
     retry_after = _rate_limiter.check(current_user.id)
     if retry_after is not None:
@@ -948,6 +1050,15 @@ async def chat_completions(
             status_code=413,
             detail=f"Request content too large ({total_content_len:,} chars). "
                    f"Maximum is {_MAX_CONTENT_LENGTH:,} chars.",
+        )
+
+    # --- Prompt injection detection ---
+    from nadirclaw.prompt_guard import check_and_act, should_block, should_warn
+    _injection_signal = check_and_act(request.messages)
+    if _injection_signal and should_block():
+        raise HTTPException(
+            status_code=400,
+            detail="Request blocked: potential prompt injection detected",
         )
 
     start_time = time.time()
@@ -1229,7 +1340,14 @@ async def chat_completions(
         if "tool_calls" in response_data:
             message["tool_calls"] = response_data["tool_calls"]
 
-        return {
+        # --- PII redaction on LLM output (non-streaming only) ---
+        from nadirclaw.pii_redactor import redact_pii
+        if message.get("content"):
+            message["content"], pii_found = redact_pii(message["content"])
+            if pii_found:
+                logger.info("PII redacted from response for request %s", request_id)
+
+        response_body = {
             "id": request_id,
             "object": "chat.completion",
             "created": int(time.time()),
@@ -1252,6 +1370,12 @@ async def chat_completions(
                 "routing": analysis_info,
             },
         }
+
+        # Build JSONResponse with optional security headers
+        resp = JSONResponse(content=response_body)
+        if _injection_signal and should_warn():
+            resp.headers["X-Prompt-Guard-Warning"] = _injection_signal.pattern_name
+        return resp
 
     except HTTPException:
         raise  # Re-raise FastAPI HTTP exceptions as-is
