@@ -513,6 +513,16 @@ async def _call_gemini(
     if request.top_p is not None:
         gen_config_kwargs["top_p"] = request.top_p
 
+    # Forward thinking config for Gemini thinking models
+    req_extra = request.model_extra or {}
+    thinking_param = req_extra.get("thinking")
+    if thinking_param and isinstance(thinking_param, dict):
+        budget = thinking_param.get("budget_tokens")
+        if budget:
+            gen_config_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_budget=budget,
+            )
+
     # NOTE: Function call parts are filtered out programmatically when
     # extracting the response (see "handle function_call parts" below),
     # so no prompt-level instruction is needed here.
@@ -600,11 +610,16 @@ async def _call_gemini(
                 finish_reason = "length"
             logger.debug("Gemini finish_reason: %s", reason_str)
 
-        # Extract text from parts (handle function_call parts gracefully)
+        # Extract text from parts (handle function_call and thought parts)
+        thinking_parts = []
         if hasattr(candidate, "content") and candidate.content and candidate.content.parts:
             text_parts = []
             for part in candidate.content.parts:
-                if hasattr(part, "text") and part.text:
+                if hasattr(part, "thought") and part.thought:
+                    # Gemini thinking model thought parts
+                    if hasattr(part, "text") and part.text:
+                        thinking_parts.append(part.text)
+                elif hasattr(part, "text") and part.text:
                     text_parts.append(part.text)
                 elif hasattr(part, "function_call") and part.function_call:
                     logger.info("Gemini returned function_call: %s (ignoring — NadirClaw doesn't execute tools)", part.function_call.name)
@@ -627,12 +642,20 @@ async def _call_gemini(
                 native_model, finish_reason, len(response.candidates) if response.candidates else 0,
             )
 
-    return {
+    result = {
         "content": content,
         "finish_reason": finish_reason,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
     }
+    if thinking_parts:
+        result["thinking"] = "".join(thinking_parts)
+    # Capture thinking token count from Gemini usage metadata
+    if usage:
+        thoughts_tok = getattr(usage, "thoughts_token_count", None)
+        if thoughts_tok:
+            result["reasoning_tokens"] = thoughts_tok
+    return result
 
 
 async def _call_litellm(
@@ -688,12 +711,18 @@ async def _call_litellm(
     if request.top_p is not None:
         call_kwargs["top_p"] = request.top_p
 
-    # Pass through tool definitions and tool_choice
+    # Pass through tool definitions, tool_choice, and thinking/reasoning params
     extra = request.model_extra or {}
     if extra.get("tools"):
         call_kwargs["tools"] = extra["tools"]
     if extra.get("tool_choice"):
         call_kwargs["tool_choice"] = extra["tool_choice"]
+    if extra.get("reasoning_effort"):
+        call_kwargs["reasoning_effort"] = extra["reasoning_effort"]
+    if extra.get("thinking"):
+        call_kwargs["thinking"] = extra["thinking"]
+    if extra.get("response_format"):
+        call_kwargs["response_format"] = extra["response_format"]
 
     if cred_provider and cred_provider != "ollama":
         api_key = get_credential(cred_provider)
@@ -721,6 +750,8 @@ async def _call_litellm(
                     anthropic_body["tools"] = req_extra["tools"]
                 if req_extra.get("tool_choice"):
                     anthropic_body["tool_choice"] = req_extra["tool_choice"]
+                if req_extra.get("thinking"):
+                    anthropic_body["thinking"] = req_extra["thinking"]
                 async with httpx.AsyncClient(timeout=120) as client:
                     resp = await client.post(
                         "https://api.anthropic.com/v1/messages",
@@ -743,12 +774,15 @@ async def _call_litellm(
                     )
                 data = resp.json()
                 content_text = ""
+                thinking_content = ""
                 for block in data.get("content", []):
                     if block.get("type") == "text":
                         content_text += block["text"]
+                    elif block.get("type") == "thinking":
+                        thinking_content += block.get("thinking", "")
                 prompt_tok = data.get("usage", {}).get("input_tokens", 0)
                 compl_tok = data.get("usage", {}).get("output_tokens", 0)
-                return {
+                result = {
                     "id": data.get("id", ""),
                     "object": "chat.completion",
                     "created": 0,
@@ -768,6 +802,9 @@ async def _call_litellm(
                     "content": content_text,
                     "finish_reason": data.get("stop_reason", "stop"),
                 }
+                if thinking_content:
+                    result["thinking"] = thinking_content
+                return result
             else:
                 call_kwargs["api_key"] = api_key
 
@@ -803,6 +840,24 @@ async def _call_litellm(
             tc.model_dump() if hasattr(tc, "model_dump") else tc
             for tc in tool_calls
         ]
+
+    # Preserve thinking/reasoning content from LLM response
+    # DeepSeek and some providers use reasoning_content
+    reasoning_content = getattr(msg, "reasoning_content", None)
+    if isinstance(reasoning_content, str) and reasoning_content:
+        result["reasoning_content"] = reasoning_content
+    # Anthropic extended thinking (via LiteLLM)
+    thinking = getattr(msg, "thinking", None)
+    if isinstance(thinking, str) and thinking:
+        result["thinking"] = thinking
+
+    # Capture reasoning token counts from usage details
+    if response.usage:
+        ctd = getattr(response.usage, "completion_tokens_details", None)
+        if ctd and not callable(ctd):
+            reasoning_tokens = getattr(ctd, "reasoning_tokens", None)
+            if isinstance(reasoning_tokens, int) and reasoning_tokens:
+                result["reasoning_tokens"] = reasoning_tokens
 
     return result
 
@@ -1283,6 +1338,20 @@ async def chat_completions(
         }
         if "tool_calls" in response_data:
             message["tool_calls"] = response_data["tool_calls"]
+        if "reasoning_content" in response_data:
+            message["reasoning_content"] = response_data["reasoning_content"]
+        if "thinking" in response_data:
+            message["thinking"] = response_data["thinking"]
+
+        usage: dict[str, Any] = {
+            "prompt_tokens": response_data["prompt_tokens"],
+            "completion_tokens": response_data["completion_tokens"],
+            "total_tokens": response_data["prompt_tokens"] + response_data["completion_tokens"],
+        }
+        if response_data.get("reasoning_tokens"):
+            usage["completion_tokens_details"] = {
+                "reasoning_tokens": response_data["reasoning_tokens"],
+            }
 
         return {
             "id": request_id,
@@ -1296,11 +1365,7 @@ async def chat_completions(
                     "finish_reason": response_data["finish_reason"],
                 }
             ],
-            "usage": {
-                "prompt_tokens": response_data["prompt_tokens"],
-                "completion_tokens": response_data["completion_tokens"],
-                "total_tokens": response_data["prompt_tokens"] + response_data["completion_tokens"],
-            },
+            "usage": usage,
             "nadirclaw_metadata": {
                 "request_id": request_id,
                 "response_time_ms": elapsed_ms,
@@ -1354,6 +1419,10 @@ def _build_streaming_response(
             delta["content"] = None
         else:
             delta["content"] = content
+        if response_data.get("reasoning_content"):
+            delta["reasoning_content"] = response_data["reasoning_content"]
+        if response_data.get("thinking"):
+            delta["thinking"] = response_data["thinking"]
         chunk = {
             "id": request_id,
             "object": "chat.completion.chunk",
@@ -1458,6 +1527,12 @@ async def _stream_litellm(
         call_kwargs["tools"] = extra["tools"]
     if extra.get("tool_choice"):
         call_kwargs["tool_choice"] = extra["tool_choice"]
+    if extra.get("reasoning_effort"):
+        call_kwargs["reasoning_effort"] = extra["reasoning_effort"]
+    if extra.get("thinking"):
+        call_kwargs["thinking"] = extra["thinking"]
+    if extra.get("response_format"):
+        call_kwargs["response_format"] = extra["response_format"]
 
     if cred_provider and cred_provider != "ollama":
         api_key = get_credential(cred_provider)
@@ -1492,6 +1567,11 @@ async def _stream_litellm(
                 tc.model_dump() if hasattr(tc, "model_dump") else tc
                 for tc in delta.tool_calls
             ]
+        # Preserve reasoning/thinking content in streaming deltas
+        if hasattr(delta, "reasoning_content") and delta.reasoning_content is not None:
+            delta_dict["reasoning_content"] = delta.reasoning_content
+        if hasattr(delta, "thinking") and delta.thinking is not None:
+            delta_dict["thinking"] = delta.thinking
 
         usage = None
         if hasattr(chunk, "usage") and chunk.usage:
