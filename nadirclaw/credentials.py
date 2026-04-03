@@ -185,6 +185,12 @@ def _check_openclaw_with_refresh(provider: str) -> Optional[str]:
     OpenClaw stores OAuth tokens with 'access', 'refresh', 'expires' (ms) fields.
     Reads them and auto-refreshes expired tokens, saving the refreshed token
     into NadirClaw's own credential store.
+
+    Important: OpenClaw OAuth tokens are issued by OpenClaw's own OAuth client
+    (via @mariozechner/pi-ai). Token refresh requires the same client_id that
+    issued the token. If NadirClaw's client_id differs, refresh will fail with 401.
+    In that case, we re-read the file (OpenClaw may have refreshed it), and if
+    still expired, return the stale token with a helpful error message.
     """
     auth_profiles_path = _openclaw_auth_profiles_path()
     if not auth_profiles_path.exists():
@@ -229,7 +235,13 @@ def _check_openclaw_with_refresh(provider: str) -> Optional[str]:
 
             logger.info("Refreshing expired OpenClaw token for %s...", provider)
             try:
-                token_data = refresh_func(refresh_tok)
+                # Pass the OpenClaw profile's clientId if available, so refresh
+                # uses the same client_id that issued the token.
+                openclaw_client_id = profile.get("clientId")
+                if openclaw_client_id:
+                    token_data = refresh_func(refresh_tok, client_id=openclaw_client_id)
+                else:
+                    token_data = refresh_func(refresh_tok)
                 new_access = token_data["access_token"]
                 new_refresh = token_data.get("refresh_token", refresh_tok)
                 new_expires_in = token_data.get("expires_in", 3600)
@@ -238,7 +250,35 @@ def _check_openclaw_with_refresh(provider: str) -> Optional[str]:
                 logger.info("OpenClaw token refreshed for %s (expires in %ds)", provider, new_expires_in)
                 return new_access
             except Exception as e:
-                logger.error("Failed to refresh OpenClaw token for %s: %s", provider, e)
+                err_str = str(e)
+                if "401" in err_str or "unauthorized" in err_str.lower():
+                    # Client ID mismatch — the token was issued by OpenClaw's
+                    # OAuth client (pi-ai) which uses a different client_id.
+                    # Re-read the file: OpenClaw may have refreshed it already.
+                    try:
+                        fresh_data = json.loads(auth_profiles_path.read_text())
+                        fresh_profiles = fresh_data.get("profiles", {})
+                        for fp in fresh_profiles.values():
+                            if fp.get("provider") not in openclaw_names:
+                                continue
+                            fresh_expires = fp.get("expires", 0) / 1000
+                            if time.time() < (fresh_expires - 60) and fp.get("access"):
+                                logger.info(
+                                    "OpenClaw has a fresh token for %s (re-read from file)", provider
+                                )
+                                return fp["access"]
+                    except (json.JSONDecodeError, OSError):
+                        pass
+
+                    logger.warning(
+                        "Cannot refresh OpenClaw token for %s: client_id mismatch (401). "
+                        "The token was issued by OpenClaw using a different OAuth client. "
+                        "Open OpenClaw to trigger a refresh, or re-authenticate: "
+                        "nadirclaw auth %s login",
+                        provider, provider,
+                    )
+                else:
+                    logger.error("Failed to refresh OpenClaw token for %s: %s", provider, e)
                 return access_token  # return stale token as last resort
 
     except (json.JSONDecodeError, OSError, KeyError) as e:
@@ -335,10 +375,20 @@ def _maybe_refresh_oauth(provider: str, entry: dict) -> Optional[str]:
         logger.info("OAuth token refreshed for %s (expires in %ds)", provider, new_expires)
         return new_access
     except Exception as e:
-        logger.error("Failed to refresh OAuth token for %s: %s", provider, e)
-        logger.warning(
-            "Re-authenticate with: nadirclaw auth %s login", provider
-        )
+        err_str = str(e)
+        if "401" in err_str or "unauthorized" in err_str.lower():
+            logger.error(
+                "OAuth token refresh failed for %s (401 Unauthorized). "
+                "This may be a client_id mismatch if the token was issued by "
+                "another OAuth client (e.g. OpenClaw). Re-authenticate: "
+                "nadirclaw auth %s login",
+                provider, provider,
+            )
+        else:
+            logger.error("Failed to refresh OAuth token for %s: %s", provider, e)
+            logger.warning(
+                "Re-authenticate with: nadirclaw auth %s login", provider
+            )
         return None
 
 

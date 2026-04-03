@@ -450,12 +450,42 @@ _gemini_client_lock = Lock()
 _gemini_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="gemini")
 
 
+def _is_oauth_token(token: str) -> bool:
+    """Detect if a credential is an OAuth access token vs an API key.
+
+    Google API keys start with 'AIza'. OAuth access tokens typically start
+    with 'ya29.' or are JWTs. OpenClaw OAuth tokens may vary but are never
+    in AIza format.
+    """
+    if token.startswith("AIza"):
+        return False
+    # OAuth access tokens from Google (ya29.*) or other JWT-like tokens
+    if token.startswith("ya29.") or token.startswith("eyJ"):
+        return True
+    # If it's from OpenClaw's auth-profiles, it's OAuth — check via credential source
+    from nadirclaw.credentials import get_credential_source
+    source = get_credential_source("google")
+    return source in ("openclaw", "oauth")
+
+
 def _get_gemini_client(api_key: str):
-    """Get or create a thread-safe, per-key google-genai Client."""
+    """Get or create a thread-safe, per-key google-genai Client.
+
+    Handles both API keys (AIza...) and OAuth access tokens (ya29...).
+    OAuth tokens require google.oauth2.credentials.Credentials instead of api_key=.
+    """
     with _gemini_client_lock:
         if api_key not in _gemini_clients:
             from google import genai
-            _gemini_clients[api_key] = genai.Client(api_key=api_key)
+
+            if _is_oauth_token(api_key):
+                from google.oauth2.credentials import Credentials
+                creds = Credentials(token=api_key)
+                _gemini_clients[api_key] = genai.Client(credentials=creds)
+                logger.debug("Created Gemini client with OAuth credentials")
+            else:
+                _gemini_clients[api_key] = genai.Client(api_key=api_key)
+                logger.debug("Created Gemini client with API key")
         return _gemini_clients[api_key]
 
 
@@ -587,6 +617,17 @@ async def _call_gemini(
                     MAX_RETRIES, native_model,
                 )
                 raise RateLimitExhausted(model=model, retry_after=retry_delay)
+        # 400/401/403 — likely auth issue. Surface credential source for debugging.
+        if e.code in (400, 401, 403):
+            from nadirclaw.credentials import get_credential_source
+            cred_source = get_credential_source(provider or "google") or "unknown"
+            is_oauth = _is_oauth_token(api_key)
+            logger.error(
+                "Gemini auth error (%s) for model=%s: %s "
+                "[credential_source=%s, is_oauth=%s, token_prefix=%s]",
+                e.code, native_model, e,
+                cred_source, is_oauth, api_key[:8] + "...",
+            )
         # Non-429 client errors — re-raise
         raise
 
