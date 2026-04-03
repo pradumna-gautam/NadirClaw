@@ -2,6 +2,16 @@
 
 All notable changes to NadirClaw will be documented in this file.
 
+## [0.14.0] - 2026-04-03
+
+### Added
+- **Thinking/reasoning token passthrough** — transparently forwards thinking parameters and extracts reasoning content from all provider paths:
+  - **Request forwarding**: `reasoning_effort` (OpenAI o-series), `thinking` (Anthropic extended thinking), `thinking_config` (Gemini), and `response_format` are now passed through to LiteLLM, Anthropic OAuth, and Gemini native paths.
+  - **Response extraction**: `reasoning_content` (DeepSeek), `thinking` blocks (Anthropic), and `thought` parts (Gemini) are captured from LLM responses and included in `choices[].message`.
+  - **Usage reporting**: `completion_tokens_details.reasoning_tokens` surfaced when providers report thinking token counts.
+  - Works in both streaming (real SSE and fake/cached SSE) and non-streaming response formats.
+- 15 new tests covering thinking parameter forwarding, response extraction, JSON serialization safety, and streaming passthrough.
+
 ## [0.13.0] - 2026-03-20
 
 ### Added
