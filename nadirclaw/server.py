@@ -1514,7 +1514,12 @@ async def _stream_litellm(
             msg["name"] = extra_fields["name"]
         messages.append(msg)
 
-    call_kwargs: Dict[str, Any] = {"model": litellm_model, "messages": messages, "stream": True}
+    call_kwargs: Dict[str, Any] = {
+        "model": litellm_model,
+        "messages": messages,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
     if request.temperature is not None:
         call_kwargs["temperature"] = request.temperature
     if request.max_tokens is not None:
@@ -1553,9 +1558,20 @@ async def _stream_litellm(
         raise
 
     async for chunk in response:
+        usage = None
+        if hasattr(chunk, "usage") and chunk.usage:
+            usage = {
+                "prompt_tokens": chunk.usage.prompt_tokens or 0,
+                "completion_tokens": chunk.usage.completion_tokens or 0,
+            }
+
         choice = chunk.choices[0] if chunk.choices else None
         if choice is None:
+            # Usage-only final chunk (no choices) -- yield usage without content
+            if usage:
+                yield {}, usage, None
             continue
+
         delta = choice.delta
         delta_dict: dict[str, Any] = {}
         if hasattr(delta, "role") and delta.role:
@@ -1572,13 +1588,6 @@ async def _stream_litellm(
             delta_dict["reasoning_content"] = delta.reasoning_content
         if hasattr(delta, "thinking") and delta.thinking is not None:
             delta_dict["thinking"] = delta.thinking
-
-        usage = None
-        if hasattr(chunk, "usage") and chunk.usage:
-            usage = {
-                "prompt_tokens": chunk.usage.prompt_tokens or 0,
-                "completion_tokens": chunk.usage.completion_tokens or 0,
-            }
 
         yield delta_dict, usage, choice.finish_reason
 
