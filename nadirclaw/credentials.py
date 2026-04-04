@@ -445,6 +445,49 @@ def get_credential(provider: str) -> Optional[str]:
     return None
 
 
+def get_gemini_oauth_config(provider: str = "google") -> Optional[dict]:
+    """Return full OAuth config for Gemini if the credential is an OAuth token.
+
+    Checks both OpenClaw auth-profiles and NadirClaw credentials for OAuth
+    metadata like project_id which is required for Vertex AI mode.
+
+    Returns:
+        Dict with 'token', 'project_id' (optional), 'source' keys, or None
+        if the credential isn't an OAuth token.
+    """
+    # Check OpenClaw auth-profiles first
+    openclaw_names = _NADIRCLAW_TO_OPENCLAW.get(provider, [provider])
+    auth_profiles_path = _openclaw_auth_profiles_path()
+    if auth_profiles_path.exists():
+        try:
+            data = json.loads(auth_profiles_path.read_text())
+            profiles = data.get("profiles", {})
+            for profile in profiles.values():
+                if profile.get("provider") not in openclaw_names:
+                    continue
+                if profile.get("type") == "oauth" and profile.get("access"):
+                    return {
+                        "token": profile["access"],
+                        "project_id": profile.get("projectId") or profile.get("project_id"),
+                        "source": "openclaw",
+                    }
+        except (json.JSONDecodeError, OSError, KeyError):
+            pass
+
+    # Check NadirClaw credentials
+    creds = _read_credentials()
+    for key in (provider, "gemini"):
+        entry = creds.get(key)
+        if entry and entry.get("source") == "oauth" and entry.get("token"):
+            return {
+                "token": entry["token"],
+                "project_id": entry.get("project_id"),
+                "source": "oauth",
+            }
+
+    return None
+
+
 def get_credential_source(provider: str) -> Optional[str]:
     """Return the source label for how a credential was resolved.
 

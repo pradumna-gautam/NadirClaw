@@ -9,6 +9,7 @@ import asyncio
 import collections
 import json
 import logging
+import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -468,11 +469,18 @@ def _is_oauth_token(token: str) -> bool:
     return source in ("openclaw", "oauth")
 
 
+# Default GCP location for Vertex AI when using OAuth tokens.
+_VERTEX_DEFAULT_LOCATION = "us-central1"
+
+
 def _get_gemini_client(api_key: str):
     """Get or create a thread-safe, per-key google-genai Client.
 
     Handles both API keys (AIza...) and OAuth access tokens (ya29...).
-    OAuth tokens require google.oauth2.credentials.Credentials instead of api_key=.
+    The google-genai SDK requires either:
+      - api_key for the Google AI API, or
+      - vertexai=True + credentials + project + location for Vertex AI API.
+    OAuth tokens (from OpenClaw/Gemini CLI) must use the Vertex AI path.
     """
     with _gemini_client_lock:
         if api_key not in _gemini_clients:
@@ -480,9 +488,29 @@ def _get_gemini_client(api_key: str):
 
             if _is_oauth_token(api_key):
                 from google.oauth2.credentials import Credentials
+                from nadirclaw.credentials import get_gemini_oauth_config
+
+                oauth_config = get_gemini_oauth_config()
+                project_id = (oauth_config or {}).get("project_id") or os.environ.get(
+                    "GOOGLE_CLOUD_PROJECT", ""
+                )
+                if not project_id:
+                    logger.warning(
+                        "Gemini OAuth token detected but no project_id found. "
+                        "Set GOOGLE_CLOUD_PROJECT env var or ensure your "
+                        "credentials include a project_id."
+                    )
                 creds = Credentials(token=api_key)
-                _gemini_clients[api_key] = genai.Client(credentials=creds)
-                logger.debug("Created Gemini client with OAuth credentials")
+                _gemini_clients[api_key] = genai.Client(
+                    vertexai=True,
+                    credentials=creds,
+                    project=project_id,
+                    location=os.environ.get("GOOGLE_CLOUD_LOCATION", _VERTEX_DEFAULT_LOCATION),
+                )
+                logger.debug(
+                    "Created Gemini client with OAuth credentials (Vertex AI, project=%s)",
+                    project_id,
+                )
             else:
                 _gemini_clients[api_key] = genai.Client(api_key=api_key)
                 logger.debug("Created Gemini client with API key")
