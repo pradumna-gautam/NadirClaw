@@ -102,19 +102,19 @@ _cors_origins_raw = os.getenv("NADIRCLAW_CORS_ORIGINS", "")
 if _cors_origins_raw:
     _cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
     _cors_credentials = True
+    _cors_origin_regex = None
 else:
-    # Local-only default: only localhost origins
-    _cors_origins = [
-        "http://localhost:*",
-        "http://127.0.0.1:*",
-        "https://localhost:*",
-        "https://127.0.0.1:*",
-    ]
+    # Local-only default: match any port on localhost/127.0.0.1
+    # Starlette does exact string matching on allow_origins, so we use
+    # allow_origin_regex to support arbitrary ports during development.
+    _cors_origins = []
+    _cors_origin_regex = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
     _cors_credentials = False  # No credentials unless origins are explicitly configured
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
+    allow_origin_regex=_cors_origin_regex,
     allow_credentials=_cors_credentials,
     allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-Request-ID"],
