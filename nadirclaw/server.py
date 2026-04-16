@@ -251,6 +251,16 @@ async def startup():
     log_dir.mkdir(parents=True, exist_ok=True)
     request_log = log_dir / "requests.jsonl"
 
+    # Log maintenance (rotation + pruning) — fast no-op if nothing to do
+    from nadirclaw.log_maintenance import run_maintenance
+
+    run_maintenance(
+        log_dir,
+        max_size_mb=settings.LOG_MAX_SIZE_MB,
+        retention_days=settings.LOG_RETENTION_DAYS,
+        compress=settings.LOG_COMPRESS,
+    )
+
     logger.info("=" * 60)
     logger.info("NadirClaw starting...")
     logger.info("Log file: %s", request_log.resolve())

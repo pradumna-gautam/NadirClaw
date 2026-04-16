@@ -134,6 +134,22 @@ class Settings:
         return Path(os.getenv("NADIRCLAW_LOG_DIR", "~/.nadirclaw/logs")).expanduser()
 
     @property
+    def LOG_MAX_SIZE_MB(self) -> int:
+        """Max size of requests.jsonl before rotation (MB)."""
+        return int(os.getenv("NADIRCLAW_LOG_MAX_SIZE_MB", "50"))
+
+    @property
+    def LOG_RETENTION_DAYS(self) -> int:
+        """Days to keep old log archives and SQLite rows."""
+        return int(os.getenv("NADIRCLAW_LOG_RETENTION_DAYS", "30"))
+
+    @property
+    def LOG_COMPRESS(self) -> bool:
+        """Gzip rotated JSONL files."""
+        val = os.getenv("NADIRCLAW_LOG_COMPRESS", "true").lower()
+        return val in ("1", "true", "yes")
+
+    @property
     def CREDENTIALS_FILE(self) -> Path:
         return Path.home() / ".nadirclaw" / "credentials.json"
 
