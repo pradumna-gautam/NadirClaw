@@ -318,7 +318,7 @@ def _count_agentic_cycles(messages: List[Any]) -> int:
 # Reasoning detection
 # ---------------------------------------------------------------------------
 
-_REASONING_MARKERS = re.compile(
+_REASONING_MARKERS_EN = re.compile(
     r"\b("
     r"step[- ]by[- ]step"
     r"|think (?:through|carefully|deeply|about)"
@@ -338,18 +338,55 @@ _REASONING_MARKERS = re.compile(
     r"|work through"
     r"|break (?:this|it) down"
     r"|logical(?:ly)? (?:deduce|infer|conclude)"
+    r"|analyze why (?:this|the|it)"
+    r"|diagnose the (?:root )?cause"
+    r"|weigh (?:the )?(?:pros|cons|options|alternatives)"
+    r"|architectural (?:decision|choice)"
+    r"|design (?:a )?(?:system|architecture)"
     r")\b",
     re.IGNORECASE,
+)
+
+_REASONING_MARKERS_ZH = re.compile(
+    r"("
+    r"一步步"
+    r"|逐步分析"
+    r"|深入思考"
+    r"|深入分析"
+    r"|推理分析"
+    r"|逻辑推理"
+    r"|优缺点"
+    r"|对比分析"
+    r"|权衡.*优劣"
+    r"|分析.*利弊"
+    r"|批判性分析"
+    r"|证明以下"
+    r"|证明这个"
+    r"|推导公式"
+    r"|推导结论"
+    r"|详细解释.*原因"
+    r"|论证以下"
+    r"|论证这个"
+    r"|演绎推理"
+    r"|归纳推理"
+    r"|设计.*系统"
+    r"|设计.*方案"
+    r")",
 )
 
 
 def detect_reasoning(prompt: str, system_message: str = "") -> Dict[str, Any]:
     """Detect if a prompt requires reasoning capabilities.
 
+    Uses separate regexes for English (with \\b word boundaries) and Chinese
+    (without \\b, since CJK characters have no word boundaries).
+
     Returns {"is_reasoning": bool, "marker_count": int, "markers": list[str]}.
     """
     combined = f"{system_message} {prompt}"
-    matches = _REASONING_MARKERS.findall(combined)
+    en_matches = _REASONING_MARKERS_EN.findall(combined)
+    zh_matches = _REASONING_MARKERS_ZH.findall(combined)
+    matches = list(set(en_matches + zh_matches))
     marker_count = len(matches)
 
     # 2+ markers = high confidence reasoning (like ClawRouter)
@@ -358,8 +395,134 @@ def detect_reasoning(prompt: str, system_message: str = "") -> Dict[str, Any]:
     return {
         "is_reasoning": is_reasoning,
         "marker_count": marker_count,
-        "markers": list(set(matches)),
+        "markers": matches,
     }
+
+
+# ---------------------------------------------------------------------------
+# Complex coding detection
+# ---------------------------------------------------------------------------
+
+_CODING_KEYWORDS = [
+    r"implement", r"add.*feature", r"refactor", r"optimize", r"improve",
+    r"fix.*bug", r"debug", r"troubleshoot", r"create.*feature",
+    r"generate.*code", r"build", r"multiple.*files", r"batch",
+]
+
+
+def detect_complex_coding(
+    messages: List[Any],
+    message_count: int = 0,
+) -> Dict[str, Any]:
+    """Detect complex coding tasks from recent tool usage patterns.
+
+    Complex coding is signaled by:
+    - Heavy editing (3+ Edit/Write calls in recent messages)
+    - Tool combination patterns (Read + Edit + Bash)
+    - Deep conversations (10+ messages)
+    - Coding task keywords in last user message
+
+    Returns {"is_complex": bool, "confidence": float, "signals": list}.
+    """
+    confidence = 0.0
+    signals: List[str] = []
+
+    # Count actual tool calls from last 6 assistant messages
+    tool_counts: Dict[str, int] = {}
+    assistant_seen = 0
+    for m in reversed(messages):
+        if getattr(m, "role", "") != "assistant":
+            continue
+        assistant_seen += 1
+        if assistant_seen > 6:
+            break
+        content = getattr(m, "content", [])
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    name = block.get("name", "")
+                    tool_counts[name] = tool_counts.get(name, 0) + 1
+
+    # Signal 1: Heavy editing
+    edit_count = sum(tool_counts.get(t, 0) for t in ("Edit", "Write", "NotebookEdit"))
+    if edit_count >= 5:
+        confidence += 0.50
+        signals.append(f"heavy_editing({edit_count})")
+    elif edit_count >= 3:
+        confidence += 0.30
+        signals.append(f"moderate_editing({edit_count})")
+
+    # Signal 2: Tool combination (Read + Edit + Bash)
+    has_read = tool_counts.get("Read", 0) > 0
+    has_edit = any(tool_counts.get(t, 0) > 0 for t in ("Edit", "Write"))
+    has_bash = tool_counts.get("Bash", 0) > 0
+    if has_read and has_edit and has_bash:
+        confidence += 0.30
+        signals.append("read_edit_bash_combo")
+    elif has_read and has_edit:
+        confidence += 0.15
+        signals.append("read_edit_combo")
+
+    # Signal 3: Deep conversation
+    if message_count >= 20:
+        confidence += 0.20
+        signals.append(f"deep_conversation({message_count})")
+    elif message_count >= 10:
+        confidence += 0.10
+        signals.append(f"moderate_conversation({message_count})")
+
+    # Signal 4: Coding keywords in last user message
+    last_user_text = ""
+    for m in reversed(messages):
+        if getattr(m, "role", "") == "user":
+            last_user_text = getattr(m, "text_content", lambda: "")()
+            break
+
+    keyword_hits = sum(
+        1 for p in _CODING_KEYWORDS
+        if re.search(p, last_user_text, re.IGNORECASE)
+    )
+    if keyword_hits >= 3:
+        confidence += 0.40
+        signals.append(f"coding_keywords({keyword_hits})")
+    elif keyword_hits >= 2:
+        confidence += 0.25
+        signals.append(f"coding_keywords({keyword_hits})")
+    elif keyword_hits >= 1:
+        confidence += 0.10
+        signals.append(f"coding_keyword({keyword_hits})")
+
+    is_complex = confidence >= 0.50
+    return {"is_complex": is_complex, "confidence": min(confidence, 1.0), "signals": signals}
+
+
+# ---------------------------------------------------------------------------
+# Code review detection
+# ---------------------------------------------------------------------------
+
+_REVIEW_MARKERS = re.compile(
+    r"(code\s*review|review\s*(?:the\s+)?(?:code|changes|pr|diff)"
+    r"|pull\s*request\s*review|security\s*(?:audit|review)"
+    r"|static\s*analysis|lint\s*check)",
+    re.IGNORECASE,
+)
+
+
+def detect_code_review(prompt: str, system_message: str = "") -> Dict[str, Any]:
+    """Detect code review/verification tasks.
+
+    Returns {"is_review": bool, "confidence": float, "signals": list}.
+    """
+    confidence = 0.0
+    signals: List[str] = []
+
+    text = f"{system_message}\n{prompt}" if system_message else prompt
+    if _REVIEW_MARKERS.search(text):
+        confidence = 0.90
+        signals.append("review_keywords")
+
+    is_review = confidence >= 0.80
+    return {"is_review": is_review, "confidence": confidence, "signals": signals}
 
 
 # ---------------------------------------------------------------------------
