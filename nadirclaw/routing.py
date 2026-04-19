@@ -6,6 +6,8 @@ model aliases, context-window filtering, and session persistence.
 
 import hashlib
 import logging
+import os
+import random
 import re
 import time
 from collections import OrderedDict
@@ -13,6 +15,111 @@ from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("nadirclaw.routing")
+
+# ---------------------------------------------------------------------------
+# Model Pool — weighted load balancing across multiple models
+# ---------------------------------------------------------------------------
+
+# Lazy-initialized: pools are built on first access, not at import time,
+# so CLI `serve --set NADIRCLAW_MODEL_POOLS=...` works correctly.
+_MODEL_POOLS_CACHE: Optional[Dict[str, List[Tuple[str, int]]]] = None
+_MODEL_TO_POOL_CACHE: Optional[Dict[str, str]] = None
+_POOL_LOCK = Lock()
+
+
+def _parse_model_pools() -> Tuple[Dict[str, List[Tuple[str, int]]], Dict[str, str]]:
+    """Parse NADIRCLAW_MODEL_POOLS env var into pool + reverse-map.
+
+    Format: "pool_name=model1,weight1+model2,weight2;pool_name2=..."
+    Example: "turbo=gemini-2.5-flash,10+gpt-4.1-nano,5;reasoning=gpt-5.2,8+claude-opus-4-6-20250918,4"
+    """
+    raw = os.getenv("NADIRCLAW_MODEL_POOLS", "")
+    if not raw:
+        return {}, {}
+    pools: Dict[str, List[Tuple[str, int]]] = {}
+    reverse: Dict[str, str] = {}
+    for pool_def in raw.split(";"):
+        pool_def = pool_def.strip()
+        if not pool_def or "=" not in pool_def:
+            continue
+        pool_name, _, models_str = pool_def.partition("=")
+        pool_name = pool_name.strip()
+        if not pool_name or not models_str:
+            continue
+        entries: List[Tuple[str, int]] = []
+        for entry in models_str.split("+"):
+            entry = entry.strip()
+            if not entry:
+                continue
+            segs = entry.rsplit(",", 1)
+            if len(segs) == 2:
+                model_name = segs[0].strip()
+                try:
+                    weight = max(1, int(segs[1].strip()))
+                except ValueError:
+                    weight = 1
+            else:
+                model_name = segs[0].strip()
+                weight = 1
+            if model_name:
+                entries.append((model_name, weight))
+                reverse[model_name] = pool_name
+        if entries:
+            pools[pool_name] = entries
+    return pools, reverse
+
+
+def _ensure_pools_loaded() -> Tuple[Dict[str, List[Tuple[str, int]]], Dict[str, str]]:
+    """Lazily build and cache model pools on first routing call."""
+    global _MODEL_POOLS_CACHE, _MODEL_TO_POOL_CACHE
+    if _MODEL_POOLS_CACHE is None:
+        with _POOL_LOCK:
+            if _MODEL_POOLS_CACHE is None:
+                _MODEL_POOLS_CACHE, _MODEL_TO_POOL_CACHE = _parse_model_pools()
+    return _MODEL_POOLS_CACHE, _MODEL_TO_POOL_CACHE
+
+
+def reload_pools() -> None:
+    """Force re-read of model pools from env (useful after serve --set)."""
+    global _MODEL_POOLS_CACHE, _MODEL_TO_POOL_CACHE
+    with _POOL_LOCK:
+        _MODEL_POOLS_CACHE, _MODEL_TO_POOL_CACHE = _parse_model_pools()
+
+
+def select_from_pool(pool_name: str) -> str:
+    """Select a model from the pool using weighted random selection.
+
+    Args:
+        pool_name: Name of the pool (e.g., "turbo", "reasoning").
+
+    Returns:
+        Selected model name.
+
+    Raises:
+        KeyError: If pool_name is not a configured pool.
+    """
+    pools, _ = _ensure_pools_loaded()
+    pool = pools.get(pool_name)
+    if not pool:
+        raise KeyError(f"Unknown model pool: {pool_name!r}. Available: {list(pools.keys())}")
+    total_weight = sum(w for _, w in pool)
+    r = random.randint(1, total_weight)
+    cumulative = 0
+    for model, weight in pool:
+        cumulative += weight
+        if r <= cumulative:
+            logger.debug(
+                "Pool %s selected: %s (weight=%d, rand=%d/%d)",
+                pool_name, model, weight, r, total_weight,
+            )
+            return model
+    return pool[0][0]
+
+
+def get_pool_for_model(model: str) -> Optional[str]:
+    """Return the pool name for a given model, or None if not in any pool."""
+    _, reverse = _ensure_pools_loaded()
+    return reverse.get(model)
 
 # ---------------------------------------------------------------------------
 # Model registry — context windows and capabilities
@@ -549,6 +656,23 @@ def apply_routing_modifiers(
                 "Context window exceeded for all models (est=%d tokens). Proceeding with %s.",
                 estimated, final_model,
             )
+
+    # --- Model Pool Selection ---
+    # If the final model belongs to a pool, select from the pool based on weights.
+    # Skip pool override for tiers where the model was explicitly chosen by reasoning
+    # or agentic detection — pool selection is for load-balancing equivalent models.
+    pool_name = get_pool_for_model(final_model)
+    if pool_name and final_tier not in ("complex", "reasoning"):
+        original_model = final_model
+        final_model = select_from_pool(pool_name)
+        if final_model != original_model:
+            routing_info["modifiers_applied"].append(
+                f"pool_selection({pool_name}: {original_model}→{final_model})"
+            )
+            logger.info(
+                "Model pool %s: %s → %s", pool_name, original_model, final_model,
+            )
+        routing_info["pool_name"] = pool_name
 
     routing_info["final_model"] = final_model
     routing_info["final_tier"] = final_tier
