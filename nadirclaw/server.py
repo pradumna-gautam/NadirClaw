@@ -1180,42 +1180,40 @@ async def chat_completions(
                 }
         else:
             # --- Smart routing (auto or no model specified) ---
-            # Check session cache first
+            # Always classify the current message, then apply
+            # upgrade-only session caching (never downgrade mid-session).
             session_cache = get_session_cache()
-            cached = session_cache.get(request.messages)
-            if cached:
-                cached_model, cached_tier = cached
-                selected_model = cached_model
-                analysis_info = {
-                    "strategy": "session-cache",
-                    "selected_model": selected_model,
-                    "tier": cached_tier,
-                    "confidence": 1.0,
-                    "complexity_score": 0,
-                }
-                logger.debug("Session cache hit: model=%s tier=%s", cached_model, cached_tier)
-            else:
-                selected_model, analysis_info = await _smart_route_full(
-                    request.messages, current_user
-                )
 
-                # Apply routing modifiers (agentic, reasoning, context window)
-                selected_model, final_tier, routing_info = apply_routing_modifiers(
-                    base_model=selected_model,
-                    base_tier=analysis_info.get("tier", "simple"),
-                    request_meta=req_meta,
-                    messages=request.messages,
-                    simple_model=settings.SIMPLE_MODEL,
-                    complex_model=settings.COMPLEX_MODEL,
-                    reasoning_model=settings.REASONING_MODEL,
-                    free_model=settings.FREE_MODEL,
-                )
-                analysis_info["tier"] = final_tier
-                analysis_info["selected_model"] = selected_model
-                analysis_info["routing_modifiers"] = routing_info
+            selected_model, analysis_info = await _smart_route_full(
+                request.messages, current_user
+            )
 
-                # Cache this decision for session persistence
-                session_cache.put(request.messages, selected_model, final_tier)
+            # Apply routing modifiers (agentic, reasoning, context window)
+            selected_model, final_tier, routing_info = apply_routing_modifiers(
+                base_model=selected_model,
+                base_tier=analysis_info.get("tier", "simple"),
+                request_meta=req_meta,
+                messages=request.messages,
+                simple_model=settings.SIMPLE_MODEL,
+                complex_model=settings.COMPLEX_MODEL,
+                reasoning_model=settings.REASONING_MODEL,
+                free_model=settings.FREE_MODEL,
+            )
+
+            # Upgrade-only cache: escalate if new tier is higher,
+            # keep cached tier if it's already equal or above.
+            selected_model, final_tier, cache_status = session_cache.upgrade_if_higher(
+                request.messages, selected_model, final_tier
+            )
+
+            analysis_info["tier"] = final_tier
+            analysis_info["selected_model"] = selected_model
+            analysis_info["routing_modifiers"] = routing_info
+            analysis_info["cache_status"] = cache_status
+            if cache_status == "kept":
+                analysis_info["strategy"] = (
+                    analysis_info.get("strategy", "smart-routing") + "+session-cache"
+                )
 
         # ------------------------------------------------------------------
         # Context optimization — compact messages before dispatch
