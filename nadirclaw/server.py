@@ -9,9 +9,10 @@ import asyncio
 import collections
 import json
 import logging
+import re
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Dict, List, Optional, Union
@@ -97,17 +98,18 @@ _ROUTING_HEADERS = ("X-Routed-Model", "X-Routed-Tier", "X-Complexity-Score")
 
 # ---------------------------------------------------------------------------
 # CORS — restrict to explicit origins (never wildcard + credentials)
+# Reads via `settings.CORS_ORIGINS` so CLI / env overrides applied after this
+# module is imported still take effect on subsequent reads (matches the
+# Settings pattern used elsewhere in the codebase).
 # ---------------------------------------------------------------------------
-_cors_origins_raw = os.getenv("NADIRCLAW_CORS_ORIGINS", "")
-if _cors_origins_raw:
-    _cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
-    _cors_credentials = True
+_cors_origins = settings.CORS_ORIGINS
+if _cors_origins:
     _cors_origin_regex = None
+    _cors_credentials = True
 else:
     # Local-only default: match any port on localhost/127.0.0.1
     # Starlette does exact string matching on allow_origins, so we use
     # allow_origin_regex to support arbitrary ports during development.
-    _cors_origins = []
     _cors_origin_regex = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
     _cors_credentials = False  # No credentials unless origins are explicitly configured
 
@@ -140,7 +142,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # Prevent caching of API responses
         if request.url.path.startswith("/v1/"):
             response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
-        if os.getenv("NADIRCLAW_HSTS", "").lower() in ("1", "true", "yes"):
+        if settings.HSTS:
             response.headers["Strict-Transport-Security"] = (
                 "max-age=31536000; includeSubDomains"
             )
@@ -244,6 +246,12 @@ class ClassifyBatchRequest(BaseModel):
 # Logging helper
 # ---------------------------------------------------------------------------
 
+# Compiled once: redacts common API-key shapes from logged system prompts.
+_API_KEY_PATTERN = re.compile(
+    r"(sk-[a-zA-Z0-9_-]{10,}|AIza[a-zA-Z0-9_-]{20,}|ghp_[a-zA-Z0-9]{20,}"
+    r"|gho_[a-zA-Z0-9]{20,}|xox[bpars]-[a-zA-Z0-9-]{10,})"
+)
+
 _log_lock = Lock()
 _log_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nadirclaw-log")
 
@@ -261,6 +269,13 @@ def _log_request_sync(entry: Dict[str, Any]) -> None:
             f.write(line)
 
 
+def _on_log_done(fut: Future) -> None:
+    """Surface exceptions from the async log thread — otherwise they're swallowed."""
+    exc = fut.exception()
+    if exc is not None:
+        logger.error("async request log write failed", exc_info=exc)
+
+
 def _log_request(entry: Dict[str, Any]) -> None:
     """Non-blocking log request — submits all blocking I/O to thread pool."""
     def _do_log():
@@ -272,7 +287,8 @@ def _log_request(entry: Dict[str, Any]) -> None:
         from nadirclaw.metrics import record_request
         record_request(entry)
 
-    _log_executor.submit(_do_log)
+    fut = _log_executor.submit(_do_log)
+    fut.add_done_callback(_on_log_done)
 
     tier = entry.get("tier", "?")
     model = entry.get("selected_model", "?")
@@ -303,16 +319,7 @@ def _extract_request_metadata(request: ChatCompletionRequest) -> Dict[str, Any]:
 
     system_text = " ".join(m.text_content() for m in system_msgs) if has_system else ""
 
-    # Sanitize system prompt for logging: redact API key patterns, truncate
-    import re
-    _API_KEY_PATTERN = re.compile(
-        r"(sk-[a-zA-Z0-9_-]{10,}|AIza[a-zA-Z0-9_-]{20,}|ghp_[a-zA-Z0-9]{20,}"
-        r"|gho_[a-zA-Z0-9]{20,}|xox[bpars]-[a-zA-Z0-9-]{10,})"
-    )
-    _log_system_prompts = os.getenv("NADIRCLAW_LOG_SYSTEM_PROMPTS", "false").lower() in (
-        "1", "true", "yes",
-    )
-    if _log_system_prompts and system_text:
+    if settings.LOG_SYSTEM_PROMPTS and system_text:
         sanitized_system_text = _API_KEY_PATTERN.sub("[REDACTED_KEY]", system_text)[:500]
     else:
         sanitized_system_text = ""
@@ -411,6 +418,12 @@ async def startup():
 
     logger.info("Ready! Listening for requests...")
     logger.info("=" * 60)
+
+
+@app.on_event("shutdown")
+def _shutdown_log_executor():
+    """Drain pending log writes on SIGTERM / uvicorn shutdown."""
+    _log_executor.shutdown(wait=True)
 
 
 # ---------------------------------------------------------------------------
