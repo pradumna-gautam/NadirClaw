@@ -10,12 +10,13 @@ import collections
 import json
 import logging
 import re
+import os
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from threading import Lock
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +31,46 @@ from nadirclaw.auth import UserSession, validate_local_auth
 from nadirclaw.settings import settings
 
 logger = logging.getLogger("nadirclaw")
+
+
+def _fallback_reason(model: str, error: Exception) -> Dict[str, str]:
+    """Build a compact, log-safe fallback failure reason."""
+    return {
+        "model": model,
+        "error_type": type(error).__name__,
+        "message": str(error)[:200].replace("\n", " "),
+    }
+
+
+def _record_provider_success(model: str) -> None:
+    if settings.PROVIDER_HEALTH is not True:
+        return
+    provider_health_tracker = _provider_health_tracker()
+    provider_health_tracker.record_success(model)
+
+
+def _record_provider_failure(model: str, error: Exception) -> None:
+    if settings.PROVIDER_HEALTH is not True:
+        return
+    provider_health_tracker = _provider_health_tracker()
+    reason = _fallback_reason(model, error)
+    provider_health_tracker.record_failure(model, reason["error_type"], reason["message"])
+
+
+def _order_fallback_candidates(chain: list[str]) -> list[str]:
+    if settings.PROVIDER_HEALTH is not True:
+        return chain
+    provider_health_tracker = _provider_health_tracker()
+    return provider_health_tracker.ordered_candidates(chain)
+
+
+def _provider_health_tracker():
+    from nadirclaw.provider_health import provider_health_tracker
+    failure_threshold = settings.PROVIDER_HEALTH_FAILURE_THRESHOLD
+    cooldown_seconds = settings.PROVIDER_HEALTH_COOLDOWN_SECONDS
+    provider_health_tracker.failure_threshold = failure_threshold if isinstance(failure_threshold, int) else 2
+    provider_health_tracker.cooldown_seconds = cooldown_seconds if isinstance(cooldown_seconds, int) else 60
+    return provider_health_tracker
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +392,16 @@ async def startup():
     log_dir.mkdir(parents=True, exist_ok=True)
     request_log = log_dir / "requests.jsonl"
 
+    # Log maintenance (rotation + pruning) — fast no-op if nothing to do
+    from nadirclaw.log_maintenance import run_maintenance
+
+    run_maintenance(
+        log_dir,
+        max_size_mb=settings.LOG_MAX_SIZE_MB,
+        retention_days=settings.LOG_RETENTION_DAYS,
+        compress=settings.LOG_COMPRESS,
+    )
+
     logger.info("=" * 60)
     logger.info("NadirClaw starting...")
     logger.info("Log file: %s", request_log.resolve())
@@ -417,6 +468,9 @@ async def startup():
         logger.warning("LiteLLM setup issue: %s", e)
 
     logger.info("Ready! Listening for requests...")
+    logger.info("")
+    logger.info("Want a hosted dashboard, trained classifier, and team billing?")
+    logger.info("Try Nadir Pro free: https://getnadir.com?ref=cli-serve")
     logger.info("=" * 60)
 
 
@@ -434,11 +488,11 @@ async def _smart_route_analysis(
     prompt: str, system_message: str, user: UserSession
 ) -> tuple:
     """Run classifier, return (selected_model, analysis_dict). No LLM call."""
-    from nadirclaw.classifier import get_binary_classifier
+    from nadirclaw.classifier import get_classifier
     from nadirclaw.telemetry import trace_span
 
     with trace_span("smart_route_analysis") as span:
-        analyzer = get_binary_classifier()
+        analyzer = get_classifier()
         result = await analyzer.analyze(text=prompt, system_message=system_message)
 
         tier_name = result.get("tier_name", "simple")
@@ -557,12 +611,69 @@ _gemini_client_lock = Lock()
 _gemini_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="gemini")
 
 
+def _is_oauth_token(token: str) -> bool:
+    """Detect if a credential is an OAuth access token vs an API key.
+
+    Google API keys start with 'AIza'. OAuth access tokens typically start
+    with 'ya29.' or are JWTs. OpenClaw OAuth tokens may vary but are never
+    in AIza format.
+    """
+    if token.startswith("AIza"):
+        return False
+    # OAuth access tokens from Google (ya29.*) or other JWT-like tokens
+    if token.startswith("ya29.") or token.startswith("eyJ"):
+        return True
+    # If it's from OpenClaw's auth-profiles, it's OAuth — check via credential source
+    from nadirclaw.credentials import get_credential_source
+    source = get_credential_source("google")
+    return source in ("openclaw", "oauth")
+
+
+# Default GCP location for Vertex AI when using OAuth tokens.
+_VERTEX_DEFAULT_LOCATION = "us-central1"
+
+
 def _get_gemini_client(api_key: str):
-    """Get or create a thread-safe, per-key google-genai Client."""
+    """Get or create a thread-safe, per-key google-genai Client.
+
+    Handles both API keys (AIza...) and OAuth access tokens (ya29...).
+    The google-genai SDK requires either:
+      - api_key for the Google AI API, or
+      - vertexai=True + credentials + project + location for Vertex AI API.
+    OAuth tokens (from OpenClaw/Gemini CLI) must use the Vertex AI path.
+    """
     with _gemini_client_lock:
         if api_key not in _gemini_clients:
             from google import genai
-            _gemini_clients[api_key] = genai.Client(api_key=api_key)
+
+            if _is_oauth_token(api_key):
+                from google.oauth2.credentials import Credentials
+                from nadirclaw.credentials import get_gemini_oauth_config
+
+                oauth_config = get_gemini_oauth_config()
+                project_id = (oauth_config or {}).get("project_id") or os.environ.get(
+                    "GOOGLE_CLOUD_PROJECT", ""
+                )
+                if not project_id:
+                    logger.warning(
+                        "Gemini OAuth token detected but no project_id found. "
+                        "Set GOOGLE_CLOUD_PROJECT env var or ensure your "
+                        "credentials include a project_id."
+                    )
+                creds = Credentials(token=api_key)
+                _gemini_clients[api_key] = genai.Client(
+                    vertexai=True,
+                    credentials=creds,
+                    project=project_id,
+                    location=os.environ.get("GOOGLE_CLOUD_LOCATION", _VERTEX_DEFAULT_LOCATION),
+                )
+                logger.debug(
+                    "Created Gemini client with OAuth credentials (Vertex AI, project=%s)",
+                    project_id,
+                )
+            else:
+                _gemini_clients[api_key] = genai.Client(api_key=api_key)
+                logger.debug("Created Gemini client with API key")
         return _gemini_clients[api_key]
 
 
@@ -619,6 +730,16 @@ async def _call_gemini(
         gen_config_kwargs["max_output_tokens"] = request.max_tokens
     if request.top_p is not None:
         gen_config_kwargs["top_p"] = request.top_p
+
+    # Forward thinking config for Gemini thinking models
+    req_extra = request.model_extra or {}
+    thinking_param = req_extra.get("thinking")
+    if thinking_param and isinstance(thinking_param, dict):
+        budget = thinking_param.get("budget_tokens")
+        if budget:
+            gen_config_kwargs["thinking_config"] = types.ThinkingConfig(
+                thinking_budget=budget,
+            )
 
     # NOTE: Function call parts are filtered out programmatically when
     # extracting the response (see "handle function_call parts" below),
@@ -684,6 +805,17 @@ async def _call_gemini(
                     MAX_RETRIES, native_model,
                 )
                 raise RateLimitExhausted(model=model, retry_after=retry_delay)
+        # 400/401/403 — likely auth issue. Surface credential source for debugging.
+        if e.code in (400, 401, 403):
+            from nadirclaw.credentials import get_credential_source
+            cred_source = get_credential_source(provider or "google") or "unknown"
+            is_oauth = _is_oauth_token(api_key)
+            logger.error(
+                "Gemini auth error (%s) for model=%s: %s "
+                "[credential_source=%s, is_oauth=%s, token_prefix=%s]",
+                e.code, native_model, e,
+                cred_source, is_oauth, api_key[:8] + "...",
+            )
         # Non-429 client errors — re-raise
         raise
 
@@ -707,11 +839,16 @@ async def _call_gemini(
                 finish_reason = "length"
             logger.debug("Gemini finish_reason: %s", reason_str)
 
-        # Extract text from parts (handle function_call parts gracefully)
+        # Extract text from parts (handle function_call and thought parts)
+        thinking_parts = []
         if hasattr(candidate, "content") and candidate.content and candidate.content.parts:
             text_parts = []
             for part in candidate.content.parts:
-                if hasattr(part, "text") and part.text:
+                if hasattr(part, "thought") and part.thought:
+                    # Gemini thinking model thought parts
+                    if hasattr(part, "text") and part.text:
+                        thinking_parts.append(part.text)
+                elif hasattr(part, "text") and part.text:
                     text_parts.append(part.text)
                 elif hasattr(part, "function_call") and part.function_call:
                     logger.info("Gemini returned function_call: %s (ignoring — NadirClaw doesn't execute tools)", part.function_call.name)
@@ -734,12 +871,20 @@ async def _call_gemini(
                 native_model, finish_reason, len(response.candidates) if response.candidates else 0,
             )
 
-    return {
+    result = {
         "content": content,
         "finish_reason": finish_reason,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
     }
+    if thinking_parts:
+        result["thinking"] = "".join(thinking_parts)
+    # Capture thinking token count from Gemini usage metadata
+    if usage:
+        thoughts_tok = getattr(usage, "thoughts_token_count", None)
+        if thoughts_tok:
+            result["reasoning_tokens"] = thoughts_tok
+    return result
 
 
 async def _call_litellm(
@@ -795,12 +940,18 @@ async def _call_litellm(
     if request.top_p is not None:
         call_kwargs["top_p"] = request.top_p
 
-    # Pass through tool definitions and tool_choice
+    # Pass through tool definitions, tool_choice, and thinking/reasoning params
     extra = request.model_extra or {}
     if extra.get("tools"):
         call_kwargs["tools"] = extra["tools"]
     if extra.get("tool_choice"):
         call_kwargs["tool_choice"] = extra["tool_choice"]
+    if extra.get("reasoning_effort"):
+        call_kwargs["reasoning_effort"] = extra["reasoning_effort"]
+    if extra.get("thinking"):
+        call_kwargs["thinking"] = extra["thinking"]
+    if extra.get("response_format"):
+        call_kwargs["response_format"] = extra["response_format"]
 
     if cred_provider and cred_provider != "ollama":
         api_key = get_credential(cred_provider)
@@ -828,6 +979,8 @@ async def _call_litellm(
                     anthropic_body["tools"] = req_extra["tools"]
                 if req_extra.get("tool_choice"):
                     anthropic_body["tool_choice"] = req_extra["tool_choice"]
+                if req_extra.get("thinking"):
+                    anthropic_body["thinking"] = req_extra["thinking"]
                 async with httpx.AsyncClient(timeout=120) as client:
                     resp = await client.post(
                         "https://api.anthropic.com/v1/messages",
@@ -850,12 +1003,15 @@ async def _call_litellm(
                     )
                 data = resp.json()
                 content_text = ""
+                thinking_content = ""
                 for block in data.get("content", []):
                     if block.get("type") == "text":
                         content_text += block["text"]
+                    elif block.get("type") == "thinking":
+                        thinking_content += block.get("thinking", "")
                 prompt_tok = data.get("usage", {}).get("input_tokens", 0)
                 compl_tok = data.get("usage", {}).get("output_tokens", 0)
-                return {
+                result = {
                     "id": data.get("id", ""),
                     "object": "chat.completion",
                     "created": 0,
@@ -875,6 +1031,9 @@ async def _call_litellm(
                     "content": content_text,
                     "finish_reason": data.get("stop_reason", "stop"),
                 }
+                if thinking_content:
+                    result["thinking"] = thinking_content
+                return result
             else:
                 call_kwargs["api_key"] = api_key
 
@@ -910,6 +1069,24 @@ async def _call_litellm(
             tc.model_dump() if hasattr(tc, "model_dump") else tc
             for tc in tool_calls
         ]
+
+    # Preserve thinking/reasoning content from LLM response
+    # DeepSeek and some providers use reasoning_content
+    reasoning_content = getattr(msg, "reasoning_content", None)
+    if isinstance(reasoning_content, str) and reasoning_content:
+        result["reasoning_content"] = reasoning_content
+    # Anthropic extended thinking (via LiteLLM)
+    thinking = getattr(msg, "thinking", None)
+    if isinstance(thinking, str) and thinking:
+        result["thinking"] = thinking
+
+    # Capture reasoning token counts from usage details
+    if response.usage:
+        ctd = getattr(response.usage, "completion_tokens_details", None)
+        if ctd and not callable(ctd):
+            reasoning_tokens = getattr(ctd, "reasoning_tokens", None)
+            if isinstance(reasoning_tokens, int) and reasoning_tokens:
+                result["reasoning_tokens"] = reasoning_tokens
 
     return result
 
@@ -963,15 +1140,17 @@ async def _call_with_fallback(
 
     try:
         response_data = await _dispatch_model(selected_model, request, provider)
+        _record_provider_success(selected_model)
         return response_data, selected_model, analysis_info
     except (RateLimitExhausted, Exception) as primary_error:
         if isinstance(primary_error, HTTPException):
             raise  # Don't fallback on validation/auth errors
+        _record_provider_failure(selected_model, primary_error)
 
         # Build fallback chain: use per-tier chain if configured, else global
         tier = analysis_info.get("tier", "")
         full_chain = settings.get_tier_fallback_chain(tier) if tier else settings.FALLBACK_CHAIN
-        chain = [m for m in full_chain if m != selected_model]
+        chain = _order_fallback_candidates([m for m in full_chain if m != selected_model])
 
         if not chain:
             if isinstance(primary_error, RateLimitExhausted):
@@ -979,6 +1158,9 @@ async def _call_with_fallback(
             raise primary_error
 
         failed_models = [selected_model]
+        analysis_info.setdefault("fallback_reasons", []).append(
+            _fallback_reason(selected_model, primary_error)
+        )
         last_error = primary_error
 
         for fallback_model in chain:
@@ -996,6 +1178,7 @@ async def _call_with_fallback(
                 response_data = await _dispatch_model(
                     fallback_model, request, fallback_provider,
                 )
+                _record_provider_success(fallback_model)
                 analysis_info = {
                     **analysis_info,
                     "fallback_from": selected_model,
@@ -1007,7 +1190,11 @@ async def _call_with_fallback(
             except (RateLimitExhausted, Exception) as chain_error:
                 if isinstance(chain_error, HTTPException):
                     raise
+                _record_provider_failure(fallback_model, chain_error)
                 failed_models.append(fallback_model)
+                analysis_info.setdefault("fallback_reasons", []).append(
+                    _fallback_reason(fallback_model, chain_error)
+                )
                 last_error = chain_error
                 continue
 
@@ -1154,42 +1341,40 @@ async def chat_completions(
                 }
         else:
             # --- Smart routing (auto or no model specified) ---
-            # Check session cache first
+            # Always classify the current message, then apply
+            # upgrade-only session caching (never downgrade mid-session).
             session_cache = get_session_cache()
-            cached = session_cache.get(request.messages)
-            if cached:
-                cached_model, cached_tier = cached
-                selected_model = cached_model
-                analysis_info = {
-                    "strategy": "session-cache",
-                    "selected_model": selected_model,
-                    "tier": cached_tier,
-                    "confidence": 1.0,
-                    "complexity_score": 0,
-                }
-                logger.debug("Session cache hit: model=%s tier=%s", cached_model, cached_tier)
-            else:
-                selected_model, analysis_info = await _smart_route_full(
-                    request.messages, current_user
-                )
 
-                # Apply routing modifiers (agentic, reasoning, context window)
-                selected_model, final_tier, routing_info = apply_routing_modifiers(
-                    base_model=selected_model,
-                    base_tier=analysis_info.get("tier", "simple"),
-                    request_meta=req_meta,
-                    messages=request.messages,
-                    simple_model=settings.SIMPLE_MODEL,
-                    complex_model=settings.COMPLEX_MODEL,
-                    reasoning_model=settings.REASONING_MODEL,
-                    free_model=settings.FREE_MODEL,
-                )
-                analysis_info["tier"] = final_tier
-                analysis_info["selected_model"] = selected_model
-                analysis_info["routing_modifiers"] = routing_info
+            selected_model, analysis_info = await _smart_route_full(
+                request.messages, current_user
+            )
 
-                # Cache this decision for session persistence
-                session_cache.put(request.messages, selected_model, final_tier)
+            # Apply routing modifiers (agentic, reasoning, context window)
+            selected_model, final_tier, routing_info = apply_routing_modifiers(
+                base_model=selected_model,
+                base_tier=analysis_info.get("tier", "simple"),
+                request_meta=req_meta,
+                messages=request.messages,
+                simple_model=settings.SIMPLE_MODEL,
+                complex_model=settings.COMPLEX_MODEL,
+                reasoning_model=settings.REASONING_MODEL,
+                free_model=settings.FREE_MODEL,
+            )
+
+            # Upgrade-only cache: escalate if new tier is higher,
+            # keep cached tier if it's already equal or above.
+            selected_model, final_tier, cache_status = session_cache.upgrade_if_higher(
+                request.messages, selected_model, final_tier
+            )
+
+            analysis_info["tier"] = final_tier
+            analysis_info["selected_model"] = selected_model
+            analysis_info["routing_modifiers"] = routing_info
+            analysis_info["cache_status"] = cache_status
+            if cache_status == "kept":
+                analysis_info["strategy"] = (
+                    analysis_info.get("strategy", "smart-routing") + "+session-cache"
+                )
 
         # ------------------------------------------------------------------
         # Context optimization — compact messages before dispatch
@@ -1221,6 +1406,48 @@ async def chat_completions(
                 "tokens_saved": opt_result.tokens_saved,
                 "optimizations_applied": opt_result.optimizations_applied,
             }
+
+        # ------------------------------------------------------------------
+        # Context compression — dedup + truncate old turns
+        # Runs AFTER optimization, BEFORE dispatch
+        # ------------------------------------------------------------------
+        compression_info = None
+        if settings.CONTEXT_COMPRESSION and len(request.messages) > settings.COMPRESS_MIN_MESSAGES:
+            from nadirclaw.compress import compress_messages
+
+            msg_dicts = []
+            for m in request.messages:
+                d: Dict[str, Any] = {"role": m.role, "content": m.content}
+                extra = m.model_extra or {}
+                if "tool_calls" in extra:
+                    d["tool_calls"] = extra["tool_calls"]
+                if "tool_call_id" in extra:
+                    d["tool_call_id"] = extra["tool_call_id"]
+                if "name" in extra:
+                    d["name"] = extra["name"]
+                msg_dicts.append(d)
+            compressed_msgs, comp_stats = compress_messages(msg_dicts)
+            if comp_stats.get("compressed"):
+                rebuilt_msgs = []
+                for d in compressed_msgs:
+                    extras: Dict[str, Any] = {}
+                    if "tool_calls" in d:
+                        extras["tool_calls"] = d["tool_calls"]
+                    if "tool_call_id" in d:
+                        extras["tool_call_id"] = d["tool_call_id"]
+                    if "name" in d:
+                        extras["name"] = d["name"]
+                    rebuilt_msgs.append(
+                        ChatMessage(role=d["role"], content=d.get("content"), **extras)
+                    )
+                request = request.model_copy(update={"messages": rebuilt_msgs})
+                compression_info = comp_stats
+                logger.info(
+                    "Context compressed: %d → %d messages (deduped=%d, truncated=%d, ratio=%.2f)",
+                    comp_stats["messages_before"], comp_stats["messages_after"],
+                    comp_stats["deduped"], comp_stats["truncated"],
+                    comp_stats["compression_ratio"],
+                )
 
         # Resolve provider credential
         from nadirclaw.credentials import detect_provider, get_credential
@@ -1287,6 +1514,7 @@ async def chat_completions(
                     "daily_spend": budget_status["daily_spend"],
                     "response_preview": "[streamed]",
                     "fallback_used": _stream_analysis.get("fallback_from"),
+                    "fallback_reasons": _stream_analysis.get("fallback_reasons", []),
                     "streaming": True,
                     "status": "error" if _stream_analysis.get("_stream_error") else "ok",
                     **_stream_req_meta,
@@ -1358,6 +1586,7 @@ async def chat_completions(
             "daily_spend": budget_status["daily_spend"],
             "response_preview": (response_data["content"] or "")[:100],
             "fallback_used": analysis_info.get("fallback_from"),
+            "fallback_reasons": analysis_info.get("fallback_reasons", []),
             "status": "ok",
             **req_meta,
             **(optimization_info or {}),
@@ -1391,6 +1620,20 @@ async def chat_completions(
         }
         if "tool_calls" in response_data:
             message["tool_calls"] = response_data["tool_calls"]
+        if "reasoning_content" in response_data:
+            message["reasoning_content"] = response_data["reasoning_content"]
+        if "thinking" in response_data:
+            message["thinking"] = response_data["thinking"]
+
+        usage: dict[str, Any] = {
+            "prompt_tokens": response_data["prompt_tokens"],
+            "completion_tokens": response_data["completion_tokens"],
+            "total_tokens": response_data["prompt_tokens"] + response_data["completion_tokens"],
+        }
+        if response_data.get("reasoning_tokens"):
+            usage["completion_tokens_details"] = {
+                "reasoning_tokens": response_data["reasoning_tokens"],
+            }
 
         response_body = {
             "id": request_id,
@@ -1404,11 +1647,7 @@ async def chat_completions(
                     "finish_reason": response_data["finish_reason"],
                 }
             ],
-            "usage": {
-                "prompt_tokens": response_data["prompt_tokens"],
-                "completion_tokens": response_data["completion_tokens"],
-                "total_tokens": response_data["prompt_tokens"] + response_data["completion_tokens"],
-            },
+            "usage": usage,
             "nadirclaw_metadata": {
                 "request_id": request_id,
                 "response_time_ms": elapsed_ms,
@@ -1464,6 +1703,10 @@ def _build_streaming_response(
             delta["content"] = None
         else:
             delta["content"] = content
+        if response_data.get("reasoning_content"):
+            delta["reasoning_content"] = response_data["reasoning_content"]
+        if response_data.get("thinking"):
+            delta["thinking"] = response_data["thinking"]
         chunk = {
             "id": request_id,
             "object": "chat.completion.chunk",
@@ -1555,7 +1798,12 @@ async def _stream_litellm(
             msg["name"] = extra_fields["name"]
         messages.append(msg)
 
-    call_kwargs: Dict[str, Any] = {"model": litellm_model, "messages": messages, "stream": True}
+    call_kwargs: Dict[str, Any] = {
+        "model": litellm_model,
+        "messages": messages,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
     if request.temperature is not None:
         call_kwargs["temperature"] = request.temperature
     if request.max_tokens is not None:
@@ -1568,6 +1816,12 @@ async def _stream_litellm(
         call_kwargs["tools"] = extra["tools"]
     if extra.get("tool_choice"):
         call_kwargs["tool_choice"] = extra["tool_choice"]
+    if extra.get("reasoning_effort"):
+        call_kwargs["reasoning_effort"] = extra["reasoning_effort"]
+    if extra.get("thinking"):
+        call_kwargs["thinking"] = extra["thinking"]
+    if extra.get("response_format"):
+        call_kwargs["response_format"] = extra["response_format"]
 
     if cred_provider and cred_provider != "ollama":
         api_key = get_credential(cred_provider)
@@ -1588,9 +1842,20 @@ async def _stream_litellm(
         raise
 
     async for chunk in response:
+        usage = None
+        if hasattr(chunk, "usage") and chunk.usage:
+            usage = {
+                "prompt_tokens": chunk.usage.prompt_tokens or 0,
+                "completion_tokens": chunk.usage.completion_tokens or 0,
+            }
+
         choice = chunk.choices[0] if chunk.choices else None
         if choice is None:
+            # Usage-only final chunk (no choices) -- yield usage without content
+            if usage:
+                yield {}, usage, None
             continue
+
         delta = choice.delta
         delta_dict: dict[str, Any] = {}
         if hasattr(delta, "role") and delta.role:
@@ -1602,13 +1867,11 @@ async def _stream_litellm(
                 tc.model_dump() if hasattr(tc, "model_dump") else tc
                 for tc in delta.tool_calls
             ]
-
-        usage = None
-        if hasattr(chunk, "usage") and chunk.usage:
-            usage = {
-                "prompt_tokens": chunk.usage.prompt_tokens or 0,
-                "completion_tokens": chunk.usage.completion_tokens or 0,
-            }
+        # Preserve reasoning/thinking content in streaming deltas
+        if hasattr(delta, "reasoning_content") and delta.reasoning_content is not None:
+            delta_dict["reasoning_content"] = delta.reasoning_content
+        if hasattr(delta, "thinking") and delta.thinking is not None:
+            delta_dict["thinking"] = delta.thinking
 
         yield delta_dict, usage, choice.finish_reason
 
@@ -1783,7 +2046,8 @@ async def _stream_with_fallback(
 
     tier = analysis_info.get("tier", "")
     full_chain = settings.get_tier_fallback_chain(tier) if tier else settings.FALLBACK_CHAIN
-    models_to_try = [selected_model] + [m for m in full_chain if m != selected_model]
+    fallback_chain = _order_fallback_candidates([m for m in full_chain if m != selected_model])
+    models_to_try = [selected_model] + fallback_chain
     created = int(time.time())
     failed_models: list[str] = []
     last_error: Exception | None = None
@@ -1842,6 +2106,8 @@ async def _stream_with_fallback(
             yield {"data": json.dumps(finish_chunk)}
             yield {"data": "[DONE]"}
 
+            _record_provider_success(model)
+
             # Update analysis_info in-place for logging
             if failed_models:
                 analysis_info["fallback_from"] = selected_model
@@ -1883,9 +2149,14 @@ async def _stream_with_fallback(
                 analysis_info["_stream_model"] = model
                 analysis_info["_stream_usage"] = accumulated_usage
                 analysis_info["_stream_error"] = str(e)
+                _record_provider_failure(model, e)
                 return
 
             # Pre-content failure — can try fallback
+            analysis_info.setdefault("fallback_reasons", []).append(
+                _fallback_reason(model, e)
+            )
+            _record_provider_failure(model, e)
             failed_models.append(model)
             last_error = e
             continue
@@ -1945,6 +2216,204 @@ async def view_logs(
 
 
 # ---------------------------------------------------------------------------
+# /v1/messages — Anthropic-compatible endpoint (Claude Code talks here)
+# ---------------------------------------------------------------------------
+
+_ANTHROPIC_UPSTREAM = "https://api.anthropic.com/v1/messages"
+_CLAUDE_OAUTH_BETA = "oauth-2025-04-20,claude-code-20250219"
+
+
+def _anthropic_messages_to_chat(messages: List[Dict[str, Any]]) -> List[ChatMessage]:
+    """Convert Anthropic message blocks to our internal ChatMessage shape.
+
+    Used only for routing classification — the actual upstream call sends
+    the original Anthropic body untouched.
+    """
+    out: List[ChatMessage] = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role", "user")
+        content = m.get("content")
+        # Normalize: string stays string; list of blocks → list of dicts the
+        # ChatMessage.text_content() can read ({"type":"text","text":...}).
+        if isinstance(content, list):
+            normalized: List[Any] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    normalized.append({"type": "text", "text": block.get("text", "")})
+                elif isinstance(block, dict) and block.get("type") == "tool_result":
+                    inner = block.get("content")
+                    if isinstance(inner, str):
+                        normalized.append({"type": "text", "text": inner})
+                    elif isinstance(inner, list):
+                        for b in inner:
+                            if isinstance(b, dict) and b.get("type") == "text":
+                                normalized.append({"type": "text", "text": b.get("text", "")})
+            out.append(ChatMessage(role=role, content=normalized))
+        else:
+            out.append(ChatMessage(role=role, content=content))
+    return out
+
+
+async def _resolve_messages_model(
+    requested_model: str,
+    chat_messages: List[ChatMessage],
+    current_user: UserSession,
+) -> Tuple[str, Dict[str, Any]]:
+    """Resolve the requested model into an upstream Anthropic model id.
+
+    Mirrors the routing logic in /v1/chat/completions but limited to the
+    Anthropic-compatible surface (no LiteLLM aliases — Claude Code is
+    talking to us as if we were api.anthropic.com).
+    """
+    from nadirclaw.routing import resolve_profile
+
+    profile = resolve_profile(requested_model)
+    if profile == "eco":
+        return settings.SIMPLE_MODEL, {"strategy": "profile:eco", "tier": "simple"}
+    if profile == "premium":
+        return settings.COMPLEX_MODEL, {"strategy": "profile:premium", "tier": "complex"}
+    if profile == "reasoning":
+        return settings.REASONING_MODEL, {"strategy": "profile:reasoning", "tier": "reasoning"}
+    if profile == "free":
+        return settings.FREE_MODEL, {"strategy": "profile:free", "tier": "free"}
+    if profile == "auto" or not requested_model:
+        selected, analysis = await _smart_route_full(chat_messages, current_user)
+        return selected, {"strategy": "smart_route", **(analysis or {})}
+    return requested_model, {"strategy": "direct", "tier": "direct"}
+
+
+def _strip_provider_prefix(model_id: str) -> str:
+    """LiteLLM-style prefixes (anthropic/, claude/) → bare model id for Anthropic."""
+    if not model_id:
+        return model_id
+    for prefix in ("anthropic/", "claude/"):
+        if model_id.startswith(prefix):
+            return model_id[len(prefix):]
+    return model_id
+
+
+def _extract_text_from_anthropic_response(payload: Dict[str, Any]) -> str:
+    text = ""
+    for block in payload.get("content", []) or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text += block.get("text", "")
+    return text
+
+
+@app.post("/v1/messages")
+async def anthropic_messages(
+    raw: Request,
+    current_user: UserSession = Depends(validate_local_auth),
+):
+    """Anthropic /v1/messages-compatible endpoint with NadirClaw routing.
+
+    The proxy treats the incoming body as opaque Anthropic JSON and only
+    rewrites the `model` field before forwarding upstream. Streaming
+    responses are piped through SSE-byte-for-SSE-byte.
+    """
+    from nadirclaw.credentials import get_credential
+
+    try:
+        body = await raw.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"invalid JSON: {e}")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="body must be a JSON object")
+
+    requested_model = body.get("model") or ""
+    stream = bool(body.get("stream"))
+    messages = body.get("messages") or []
+    if not isinstance(messages, list):
+        raise HTTPException(status_code=400, detail="messages must be an array")
+
+    chat_messages = _anthropic_messages_to_chat(messages)
+    selected_model, analysis_info = await _resolve_messages_model(
+        requested_model, chat_messages, current_user
+    )
+    upstream_model = _strip_provider_prefix(selected_model)
+
+    body["model"] = upstream_model
+
+    token = get_credential("anthropic")
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="No anthropic credential. Run `nadirclaw auth setup-token`.",
+        )
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "anthropic-version": body.pop("anthropic_version", None) or raw.headers.get("anthropic-version") or "2023-06-01",
+        "anthropic-beta": raw.headers.get("anthropic-beta") or _CLAUDE_OAUTH_BETA,
+        "content-type": "application/json",
+    }
+    # If the upstream token is an API key (not OAuth), switch to x-api-key.
+    if token.startswith("sk-ant-api"):
+        headers.pop("Authorization", None)
+        headers["x-api-key"] = token
+
+    import httpx
+    from fastapi.responses import StreamingResponse
+
+    log_entry: Dict[str, Any] = {
+        "type": "messages",
+        "requested_model": requested_model,
+        "selected_model": upstream_model,
+        "streaming": stream,
+        **analysis_info,
+    }
+
+    if not stream:
+        async with httpx.AsyncClient(timeout=300) as client:
+            try:
+                upstream = await client.post(_ANTHROPIC_UPSTREAM, headers=headers, json=body)
+            except httpx.HTTPError as e:
+                _log_request({**log_entry, "error": f"upstream_error: {e}"})
+                raise HTTPException(status_code=502, detail=f"upstream error: {e}")
+
+        if upstream.status_code != 200:
+            _log_request({**log_entry, "error": f"upstream_status_{upstream.status_code}", "body": upstream.text[:500]})
+            return Response(
+                content=upstream.content,
+                status_code=upstream.status_code,
+                media_type=upstream.headers.get("content-type", "application/json"),
+            )
+
+        payload = upstream.json()
+        usage = payload.get("usage", {}) if isinstance(payload, dict) else {}
+        _log_request({
+            **log_entry,
+            "prompt_tokens": usage.get("input_tokens", 0),
+            "completion_tokens": usage.get("output_tokens", 0),
+            "response_preview": _extract_text_from_anthropic_response(payload)[:200],
+        })
+        return JSONResponse(content=payload, status_code=200)
+
+    # Streaming: pipe SSE bytes straight through.
+    async def proxy_stream():
+        async with httpx.AsyncClient(timeout=300) as client:
+            async with client.stream(
+                "POST", _ANTHROPIC_UPSTREAM, headers=headers, json=body
+            ) as upstream:
+                if upstream.status_code != 200:
+                    err_body = await upstream.aread()
+                    _log_request({
+                        **log_entry,
+                        "error": f"upstream_stream_status_{upstream.status_code}",
+                        "body": err_body[:500].decode("utf-8", errors="replace"),
+                    })
+                    yield f"event: error\ndata: {json.dumps({'type': 'error', 'error': {'type': 'upstream_error', 'message': err_body.decode('utf-8', errors='replace')[:500]}})}\n\n".encode()
+                    return
+                async for chunk in upstream.aiter_bytes():
+                    if chunk:
+                        yield chunk
+        _log_request(log_entry)
+
+    return StreamingResponse(proxy_stream(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
 # /v1/models & /health
 # ---------------------------------------------------------------------------
 
@@ -1980,15 +2449,43 @@ async def list_models(
     current_user: UserSession = Depends(validate_local_auth),
 ) -> Dict[str, Any]:
     now = int(time.time())
-    # Routing profiles first, then tier models
+    created_at_iso = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Routing profiles first, then tier models. We emit BOTH Anthropic-style
+    # fields (`type`, `display_name`, `created_at`) and OpenAI-style fields
+    # (`object`, `created`, `owned_by`) so every client (Claude Code, Open
+    # WebUI, Cursor, OpenClaw) sees something it understands.
+    profile_meta = [
+        ("nadir-auto",      "Nadir — Auto",      "Smart routing per prompt (recommended)"),
+        ("nadir-eco",       "Nadir — Eco",       "Always cheapest tier (Haiku-class)"),
+        ("nadir-premium",   "Nadir — Premium",   "Always strongest tier (Opus-class)"),
+        ("nadir-reasoning", "Nadir — Reasoning", "Always reasoning model"),
+        ("nadir-free",      "Nadir — Free",      "Always local/free tier"),
+        # Legacy short names — kept so existing OpenAI-compatible clients
+        # (Open WebUI, Cursor, OpenClaw) don't break.
+        ("auto",    "Auto",    "Smart routing per prompt"),
+        ("eco",     "Eco",     "Cheapest tier"),
+        ("premium", "Premium", "Strongest tier"),
+    ]
     profiles = [
-        {"id": "auto", "object": "model", "created": now, "owned_by": "nadirclaw"},
-        {"id": "eco", "object": "model", "created": now, "owned_by": "nadirclaw"},
-        {"id": "premium", "object": "model", "created": now, "owned_by": "nadirclaw"},
+        {
+            "id": pid,
+            "type": "model",
+            "display_name": display,
+            "description": desc,
+            "created_at": created_at_iso,
+            # OpenAI-compatible legacy fields
+            "object": "model",
+            "created": now,
+            "owned_by": "nadirclaw",
+        }
+        for pid, display, desc in profile_meta
     ]
     tier_data = [
         {
             "id": m,
+            "type": "model",
+            "display_name": m,
+            "created_at": created_at_iso,
             "object": "model",
             "created": now,
             "owned_by": m.split("/")[0] if "/" in m else "api",
@@ -2017,6 +2514,13 @@ async def health():
         "simple_model": settings.SIMPLE_MODEL,
         "complex_model": settings.COMPLEX_MODEL,
     }
+
+
+@app.get("/internal/provider_health")
+async def provider_health():
+    if settings.PROVIDER_HEALTH is not True:
+        raise HTTPException(status_code=404, detail="Not found")
+    return _provider_health_tracker().snapshot()
 
 
 @app.get("/")

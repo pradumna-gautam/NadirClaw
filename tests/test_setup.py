@@ -26,6 +26,7 @@ from nadirclaw.setup import (
     select_default_model,
     write_env_file,
 )
+from nadirclaw.model_metadata import load_model_metadata, parse_model_metadata
 
 
 @pytest.fixture(autouse=True)
@@ -96,6 +97,10 @@ class TestClassifyModelTier:
 
     def test_reasoner_is_reasoning(self):
         assert classify_model_tier("deepseek/deepseek-reasoner") == "reasoning"
+
+    def test_deepseek_v4_tiers(self):
+        assert classify_model_tier("deepseek/deepseek-v4-flash") == "simple"
+        assert classify_model_tier("deepseek/deepseek-v4-pro") == "complex"
 
     def test_ollama_is_free(self):
         assert classify_model_tier("ollama/llama3.1:8b") == "free"
@@ -170,7 +175,12 @@ class TestFilterTopModels:
         assert result == models
 
     def test_deepseek_no_filter(self):
-        models = ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner"]
+        models = [
+            "deepseek/deepseek-chat",
+            "deepseek/deepseek-reasoner",
+            "deepseek/deepseek-v4-flash",
+            "deepseek/deepseek-v4-pro",
+        ]
         result = _filter_top_models("deepseek", models)
         assert result == models
 
@@ -251,6 +261,11 @@ class TestSelectDefaultModel:
     def test_ollama_free(self):
         result = select_default_model("free", ["ollama"])
         assert result == "ollama/llama3.1:8b"
+
+    def test_deepseek_defaults(self):
+        assert select_default_model("simple", ["deepseek"]) == "deepseek/deepseek-chat"
+        assert select_default_model("complex", ["deepseek"]) == "deepseek/deepseek-reasoner"
+        assert select_default_model("reasoning", ["deepseek"]) == "deepseek/deepseek-reasoner"
 
     def test_no_matching_provider(self):
         result = select_default_model("simple", ["nonexistent"])
@@ -509,6 +524,149 @@ class TestSetupCLI:
         runner = CliRunner()
         result = runner.invoke(main, ["setup"], input="n\n")
         assert result.exit_code == 0
+
+    def test_update_models_writes_metadata(self, tmp_path):
+        from nadirclaw.cli import main
+
+        output = tmp_path / "models.json"
+        runner = CliRunner()
+        result = runner.invoke(main, ["update-models", "--output", str(output)])
+
+        assert result.exit_code == 0
+        assert output.exists()
+        models = load_model_metadata(output)
+        assert "deepseek/deepseek-v4-pro" in models
+        assert "Updated" in result.output
+
+    def test_update_models_dry_run(self, tmp_path):
+        from nadirclaw.cli import main
+
+        output = tmp_path / "models.json"
+        runner = CliRunner()
+        result = runner.invoke(main, ["update-models", "--output", str(output), "--dry-run"])
+
+        assert result.exit_code == 0
+        assert not output.exists()
+        assert "Would write" in result.output
+
+    def test_update_models_source_url(self, tmp_path, monkeypatch):
+        from nadirclaw.cli import main
+
+        output = tmp_path / "models.json"
+        payload = json.dumps({
+            "models": {
+                "custom/source-model": {
+                    "context_window": 12345,
+                    "cost_per_m_input": 0,
+                    "cost_per_m_output": 0,
+                    "has_vision": False,
+                }
+            }
+        }).encode()
+
+        class _FakeResponse:
+            def __init__(self, body):
+                self._body = body
+            def read(self, size=-1):
+                if size is None or size < 0:
+                    body, self._body = self._body, b""
+                    return body
+                body, self._body = self._body[:size], self._body[size:]
+                return body
+            def __enter__(self):
+                return self
+            def __exit__(self, *_):
+                return False
+
+        def fake_urlopen(url, timeout=None):
+            assert url == "https://example.test/models.json"
+            return _FakeResponse(payload)
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["update-models", "--output", str(output), "--source-url", "https://example.test/models.json"],
+        )
+
+        assert result.exit_code == 0, result.output
+        models = load_model_metadata(output)
+        assert models["custom/source-model"]["context_window"] == 12345
+
+    def test_update_models_cli_source_requires_http(self, tmp_path):
+        from nadirclaw.cli import main
+
+        output = tmp_path / "models.json"
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["update-models", "--output", str(output), "--source-url", "file:///etc/passwd"],
+        )
+
+        assert result.exit_code != 0
+        assert "Source URL must use http(s)" in result.output
+        assert not output.exists()
+
+    def test_update_models_env_source_requires_http(self, tmp_path, monkeypatch):
+        from nadirclaw.cli import main
+
+        output = tmp_path / "models.json"
+        monkeypatch.setenv("NADIRCLAW_MODEL_REGISTRY_URL", "file:///etc/passwd")
+
+        runner = CliRunner()
+        result = runner.invoke(main, ["update-models", "--output", str(output)])
+
+        assert result.exit_code != 0
+        assert "Source URL must use http(s)" in result.output
+        assert not output.exists()
+
+    def test_update_models_rejects_oversized_payload(self, tmp_path, monkeypatch):
+        from nadirclaw.cli import main
+
+        class _BigResponse:
+            def read(self, size=-1):
+                return b"x" * (size if size and size > 0 else 1)
+            def __enter__(self):
+                return self
+            def __exit__(self, *_):
+                return False
+
+        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _BigResponse())
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["update-models", "--output", str(tmp_path / "models.json"),
+             "--source-url", "https://example.test/big.json"],
+        )
+
+        assert result.exit_code != 0
+        assert "exceeds" in result.output
+
+    def test_update_models_source_failure_is_click_error(self, tmp_path, monkeypatch):
+        import urllib.error
+
+        from nadirclaw.cli import main
+
+        def fail_urlopen(*args, **kwargs):
+            raise urllib.error.URLError("network down")
+
+        monkeypatch.setattr("urllib.request.urlopen", fail_urlopen)
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["update-models", "--output", str(tmp_path / "models.json"), "--source-url", "https://example.test/models.json"],
+        )
+
+        assert result.exit_code != 0
+        assert "network down" in result.output
+
+    def test_model_metadata_rejects_invalid_values(self):
+        with pytest.raises(ValueError, match="context_window"):
+            parse_model_metadata({"models": {"bad/model": {"context_window": "lots"}}})
+        with pytest.raises(ValueError, match="cost_per_m_input"):
+            parse_model_metadata({"models": {"bad/model": {"cost_per_m_input": -5}}})
+        with pytest.raises(ValueError, match="has_vision"):
+            parse_model_metadata({"models": {"bad/model": {"has_vision": "no"}}})
 
 
 # ---------------------------------------------------------------------------

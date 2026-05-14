@@ -134,6 +134,22 @@ class Settings:
         return Path(os.getenv("NADIRCLAW_LOG_DIR", "~/.nadirclaw/logs")).expanduser()
 
     @property
+    def LOG_MAX_SIZE_MB(self) -> int:
+        """Max size of requests.jsonl before rotation (MB)."""
+        return int(os.getenv("NADIRCLAW_LOG_MAX_SIZE_MB", "50"))
+
+    @property
+    def LOG_RETENTION_DAYS(self) -> int:
+        """Days to keep old log archives and SQLite rows."""
+        return int(os.getenv("NADIRCLAW_LOG_RETENTION_DAYS", "30"))
+
+    @property
+    def LOG_COMPRESS(self) -> bool:
+        """Gzip rotated JSONL files."""
+        val = os.getenv("NADIRCLAW_LOG_COMPRESS", "true").lower()
+        return val in ("1", "true", "yes")
+
+    @property
     def CREDENTIALS_FILE(self) -> Path:
         return Path.home() / ".nadirclaw" / "credentials.json"
 
@@ -146,6 +162,20 @@ class Settings:
     def FREE_MODEL(self) -> str:
         """Free fallback model. Falls back to SIMPLE_MODEL."""
         return os.getenv("NADIRCLAW_FREE_MODEL", "") or self.SIMPLE_MODEL
+
+    @property
+    def COMPLEXITY_ANALYZER_TYPE(self) -> str:
+        """Which classifier to use for smart routing.
+
+          - "binary"     (default) — fast 2-class centroid classifier (~10ms, 22MB)
+          - "distilbert"           — 3-class fine-tuned DistilBERT (~30ms, 256MB)
+                                     produces simple/mid/complex tiers natively.
+
+        Set via NADIRCLAW_COMPLEXITY_ANALYZER. The DistilBERT artifact is not
+        shipped in the package — install separately or train via
+        `nadir.distilbert_classifier.DistilBertClassifier()`.
+        """
+        return os.getenv("NADIRCLAW_COMPLEXITY_ANALYZER", "binary").strip().lower()
 
     @property
     def FALLBACK_CHAIN(self) -> list[str]:
@@ -194,6 +224,27 @@ class Settings:
             return max(0, int(os.getenv("NADIRCLAW_DEFAULT_MODEL_RPM", "0")))
         except ValueError:
             return 0
+
+    @property
+    def PROVIDER_HEALTH(self) -> bool:
+        """Enable health-aware fallback routing."""
+        return os.getenv("NADIRCLAW_PROVIDER_HEALTH", "").lower() in ("1", "true", "yes")
+
+    @property
+    def PROVIDER_HEALTH_COOLDOWN_SECONDS(self) -> int:
+        """Seconds to skip unhealthy fallback candidates before re-admitting them."""
+        try:
+            return max(1, int(os.getenv("NADIRCLAW_PROVIDER_HEALTH_COOLDOWN_SECONDS", "60")))
+        except ValueError:
+            return 60
+
+    @property
+    def PROVIDER_HEALTH_FAILURE_THRESHOLD(self) -> int:
+        """Consecutive health failures before a fallback candidate enters cooldown."""
+        try:
+            return max(1, int(os.getenv("NADIRCLAW_PROVIDER_HEALTH_FAILURE_THRESHOLD", "2")))
+        except ValueError:
+            return 2
 
     @property
     def OPTIMIZE(self) -> str:
@@ -256,6 +307,31 @@ class Settings:
         if self.SIMPLE_MODEL not in models:
             models.append(self.SIMPLE_MODEL)
         return models
+
+    @property
+    def CONTEXT_COMPRESSION(self) -> bool:
+        """Enable context compression for long conversations."""
+        return os.getenv("NADIRCLAW_CONTEXT_COMPRESSION", "false").lower() in ("true", "1", "yes")
+
+    @property
+    def COMPRESS_MIN_MESSAGES(self) -> int:
+        """Minimum message count before compression kicks in."""
+        return int(os.getenv("NADIRCLAW_COMPRESS_MIN_MESSAGES", "30"))
+
+    @property
+    def COMPRESS_RECENT_WINDOW(self) -> int:
+        """Number of recent messages to preserve intact."""
+        return int(os.getenv("NADIRCLAW_COMPRESS_RECENT_WINDOW", "20"))
+
+    @property
+    def COMPRESS_TOOL_OUTPUT_MAX(self) -> int:
+        """Max characters for truncated tool output."""
+        return int(os.getenv("NADIRCLAW_COMPRESS_TOOL_MAX", "500"))
+
+    @property
+    def AGENT_ROLE_DETECTION(self) -> bool:
+        """Enable agent role detection for coding agents (opt-in)."""
+        return os.getenv("NADIRCLAW_AGENT_ROLE_DETECTION", "false").lower() in ("true", "1", "yes")
 
 
 settings = Settings()

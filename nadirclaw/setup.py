@@ -49,7 +49,7 @@ PROVIDER_INFO: Dict[str, Dict] = {
     },
     "deepseek": {
         "display": "DeepSeek",
-        "description": "DeepSeek V3, Reasoner",
+        "description": "DeepSeek V4 Flash, V4 Pro, Reasoner",
         "env_var": "DEEPSEEK_API_KEY",
         "key_prefix": "sk-",
         "oauth": False,

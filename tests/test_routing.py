@@ -1,12 +1,15 @@
 """Tests for nadirclaw.routing — routing intelligence."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
 from nadirclaw.routing import (
+    MODEL_REGISTRY,
     MODEL_ALIASES,
     SessionCache,
+    _merge_external_model_metadata,
     apply_routing_modifiers,
     check_context_window,
     detect_agentic,
@@ -15,6 +18,7 @@ from nadirclaw.routing import (
     estimate_cost,
     estimate_token_count,
     has_vision,
+    get_context_window,
     resolve_alias,
     resolve_profile,
 )
@@ -92,6 +96,9 @@ class TestResolveAlias:
 
     def test_deepseek(self):
         assert resolve_alias("deepseek") == "deepseek/deepseek-chat"
+        assert resolve_alias("deepseek-v4") == "deepseek/deepseek-v4-flash"
+        assert resolve_alias("deepseek-v4-flash") == "deepseek/deepseek-v4-flash"
+        assert resolve_alias("deepseek-v4-pro") == "deepseek/deepseek-v4-pro"
         assert resolve_alias("deepseek-r1") == "deepseek/deepseek-reasoner"
 
 
@@ -307,6 +314,132 @@ class TestSessionCache:
         removed = cache.clear_expired()
         assert removed == 1
 
+    # ----- put() upgrade-only guard ----------------------------------------
+
+    def test_put_does_not_downgrade(self):
+        """put() must not replace a higher-tier entry with a lower-tier one."""
+        cache = SessionCache(ttl_seconds=60)
+        msgs = [_msg("user", "Hello")]
+        cache.put(msgs, "claude-opus", "reasoning")
+        cache.put(msgs, "gpt-4o-mini", "simple")
+        # Reasoning outranks simple — original entry must remain.
+        assert cache.get(msgs) == ("claude-opus", "reasoning")
+
+    def test_put_keeps_equal_tier(self):
+        """put() with the same tier is a no-op (no timestamp churn either)."""
+        cache = SessionCache(ttl_seconds=60)
+        msgs = [_msg("user", "Hello")]
+        cache.put(msgs, "gpt-4o", "complex")
+        cache.put(msgs, "claude-sonnet", "complex")  # equal tier, different model
+        # Original model retained.
+        assert cache.get(msgs) == ("gpt-4o", "complex")
+
+    def test_put_upgrades_when_higher(self):
+        """put() with a higher tier replaces the cached entry."""
+        cache = SessionCache(ttl_seconds=60)
+        msgs = [_msg("user", "Hello")]
+        cache.put(msgs, "gpt-4o-mini", "simple")
+        cache.put(msgs, "claude-opus", "reasoning")
+        assert cache.get(msgs) == ("claude-opus", "reasoning")
+
+    # ----- upgrade_if_higher() ---------------------------------------------
+
+    def test_upgrade_if_higher_new_session(self):
+        """No cached entry → store the new values, status='new'."""
+        cache = SessionCache(ttl_seconds=60)
+        msgs = [_msg("user", "Hello")]
+        model, tier, status = cache.upgrade_if_higher(msgs, "gpt-4o", "complex")
+        assert (model, tier, status) == ("gpt-4o", "complex", "new")
+        assert cache.get(msgs) == ("gpt-4o", "complex")
+
+    def test_upgrade_if_higher_escalates(self):
+        """Lower cached tier → upgrade to higher tier, status='upgraded'."""
+        cache = SessionCache(ttl_seconds=60)
+        msgs = [_msg("user", "Hello")]
+        cache.upgrade_if_higher(msgs, "gpt-4o-mini", "simple")
+        model, tier, status = cache.upgrade_if_higher(
+            msgs, "claude-opus", "reasoning"
+        )
+        assert (model, tier, status) == ("claude-opus", "reasoning", "upgraded")
+        assert cache.get(msgs) == ("claude-opus", "reasoning")
+
+    def test_upgrade_if_higher_keeps_higher(self):
+        """Higher cached tier → keep cached values, status='kept'."""
+        cache = SessionCache(ttl_seconds=60)
+        msgs = [_msg("user", "Hello")]
+        cache.upgrade_if_higher(msgs, "claude-opus", "reasoning")
+        model, tier, status = cache.upgrade_if_higher(msgs, "gpt-4o-mini", "simple")
+        assert (model, tier, status) == ("claude-opus", "reasoning", "kept")
+        assert cache.get(msgs) == ("claude-opus", "reasoning")
+
+    def test_upgrade_if_higher_keeps_equal(self):
+        """Equal cached tier → keep cached values, status='kept'."""
+        cache = SessionCache(ttl_seconds=60)
+        msgs = [_msg("user", "Hello")]
+        cache.upgrade_if_higher(msgs, "gpt-4o", "complex")
+        model, tier, status = cache.upgrade_if_higher(msgs, "claude-sonnet", "complex")
+        assert (model, tier, status) == ("gpt-4o", "complex", "kept")
+
+    def test_upgrade_if_higher_full_hierarchy(self):
+        """simple < mid < complex < reasoning ordering is honored."""
+        cache = SessionCache(ttl_seconds=60)
+        msgs = [_msg("user", "Hello")]
+        # Walk up the hierarchy — every step should upgrade.
+        for tier_name in ("simple", "mid", "complex", "reasoning"):
+            _, tier, status = cache.upgrade_if_higher(msgs, f"m-{tier_name}", tier_name)
+            assert tier == tier_name
+            assert status in ("new", "upgraded")
+        # Now walking back down should keep "reasoning" at every step.
+        for tier_name in ("complex", "mid", "simple"):
+            model, tier, status = cache.upgrade_if_higher(
+                msgs, f"m-{tier_name}", tier_name
+            )
+            assert (model, tier, status) == ("m-reasoning", "reasoning", "kept")
+
+    def test_upgrade_if_higher_expired_entry_treated_as_missing(self):
+        """Stale (TTL-expired) high-tier entry must NOT block a fresh classification."""
+        import time
+        cache = SessionCache(ttl_seconds=60)
+        msgs = [_msg("user", "Hello")]
+        # Directly inject an entry whose timestamp is well past the TTL.
+        key = cache._make_key(msgs)
+        cache._cache[key] = ("claude-opus", "reasoning", time.time() - 3600)
+        # Even though "reasoning" outranks "simple", the stale entry should be
+        # discarded and the fresh classification should win.
+        model, tier, status = cache.upgrade_if_higher(msgs, "gpt-4o-mini", "simple")
+        assert (model, tier, status) == ("gpt-4o-mini", "simple", "new")
+        assert cache.get(msgs) == ("gpt-4o-mini", "simple")
+
+    def test_upgrade_if_higher_evicts_when_over_capacity(self):
+        """upgrade_if_higher must enforce max_size via LRU eviction."""
+        cache = SessionCache(ttl_seconds=60, max_size=3)
+        # Insert 5 distinct sessions — only the 3 most recent should remain.
+        for i in range(5):
+            cache.upgrade_if_higher([_msg("user", f"prompt-{i}")], f"m-{i}", "simple")
+        assert len(cache._cache) == 3
+        # The first two sessions should have been evicted.
+        assert cache.get([_msg("user", "prompt-0")]) is None
+        assert cache.get([_msg("user", "prompt-1")]) is None
+        # The most recent three should still be there.
+        assert cache.get([_msg("user", "prompt-4")]) == ("m-4", "simple")
+
+    def test_upgrade_if_higher_touch_updates_lru(self):
+        """Touching an entry via upgrade_if_higher should mark it as most-recently-used."""
+        cache = SessionCache(ttl_seconds=60, max_size=3)
+        msgs_a = [_msg("user", "A")]
+        msgs_b = [_msg("user", "B")]
+        msgs_c = [_msg("user", "C")]
+        cache.upgrade_if_higher(msgs_a, "m-a", "simple")
+        cache.upgrade_if_higher(msgs_b, "m-b", "simple")
+        cache.upgrade_if_higher(msgs_c, "m-c", "simple")
+        # Touch A by re-querying it via upgrade_if_higher (status='kept').
+        cache.upgrade_if_higher(msgs_a, "m-a-new", "simple")
+        # Now insert a 4th entry — B should be evicted (LRU), not A.
+        cache.upgrade_if_higher([_msg("user", "D")], "m-d", "simple")
+        assert cache.get(msgs_a) == ("m-a", "simple")
+        assert cache.get(msgs_b) is None  # evicted
+        assert cache.get(msgs_c) == ("m-c", "simple")
+
 
 # ---------------------------------------------------------------------------
 # estimate_cost
@@ -318,12 +451,82 @@ class TestEstimateCost:
         assert cost is not None
         assert cost > 0
 
+    def test_deepseek_v4_cost(self):
+        cost = estimate_cost("deepseek/deepseek-v4-pro", 1_000_000, 1_000_000)
+        assert cost == pytest.approx(5.22)
+
     def test_unknown_model(self):
         assert estimate_cost("unknown-xyz", 1000, 500) is None
 
     def test_free_model(self):
         cost = estimate_cost("ollama/llama3.1:8b", 1000, 500)
         assert cost == 0.0
+
+
+# ---------------------------------------------------------------------------
+# local model metadata
+# ---------------------------------------------------------------------------
+
+class TestLocalModelMetadata:
+    def test_external_metadata_adds_model(self, tmp_path, monkeypatch):
+        path = tmp_path / "models.json"
+        model = "custom/custom-fast"
+        path.write_text(json.dumps({
+            "models": {
+                model: {
+                    "context_window": 32768,
+                    "cost_per_m_input": 0,
+                    "cost_per_m_output": 0,
+                    "has_vision": False,
+                }
+            }
+        }))
+        monkeypatch.setenv("NADIRCLAW_MODEL_METADATA_FILE", str(path))
+        monkeypatch.setenv("NADIRCLAW_LOCAL_MODEL_METADATA_FILE", str(tmp_path / "missing.json"))
+
+        try:
+            _merge_external_model_metadata()
+            assert get_context_window(model) == 32768
+            assert estimate_cost(model, 1000, 1000) == 0.0
+        finally:
+            MODEL_REGISTRY.pop(model, None)
+
+    def test_local_overrides_generated(self, tmp_path, monkeypatch):
+        generated = tmp_path / "models.json"
+        local = tmp_path / "models.local.json"
+        model = "custom/override-me"
+        generated.write_text(json.dumps({
+            "models": {
+                model: {"context_window": 1000, "cost_per_m_input": 1.0,
+                        "cost_per_m_output": 2.0, "has_vision": False},
+            }
+        }))
+        local.write_text(json.dumps({
+            "models": {
+                model: {"context_window": 5000, "cost_per_m_input": 0.5},
+            }
+        }))
+        monkeypatch.setenv("NADIRCLAW_MODEL_METADATA_FILE", str(generated))
+        monkeypatch.setenv("NADIRCLAW_LOCAL_MODEL_METADATA_FILE", str(local))
+
+        try:
+            _merge_external_model_metadata()
+            assert get_context_window(model) == 5000
+            info = MODEL_REGISTRY[model]
+            assert info["cost_per_m_input"] == 0.5
+            assert info["cost_per_m_output"] == 2.0
+        finally:
+            MODEL_REGISTRY.pop(model, None)
+
+    def test_invalid_metadata_file_is_skipped(self, tmp_path, monkeypatch, caplog):
+        path = tmp_path / "models.json"
+        path.write_text("{not valid json")
+        monkeypatch.setenv("NADIRCLAW_MODEL_METADATA_FILE", str(path))
+        monkeypatch.setenv("NADIRCLAW_LOCAL_MODEL_METADATA_FILE", str(tmp_path / "missing.json"))
+
+        with caplog.at_level("WARNING", logger="nadirclaw.routing"):
+            _merge_external_model_metadata()
+        assert any("Skipping invalid model metadata file" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -674,8 +877,14 @@ class TestCostBreakdown:
 # ---------------------------------------------------------------------------
 
 class TestSettingsMidTier:
-    def test_default_no_mid(self):
+    def test_default_no_mid(self, monkeypatch):
+        # Import first so settings.py's import-time load_dotenv() runs and the
+        # module is cached — otherwise the import below would re-run
+        # load_dotenv() and re-populate the var we're about to delete.
         from nadirclaw.settings import Settings
+        # Hermetic: ignore any NADIRCLAW_MID_MODEL inherited from the
+        # environment or ~/.nadirclaw/.env on the developer's machine.
+        monkeypatch.delenv("NADIRCLAW_MID_MODEL", raising=False)
         s = Settings()
         assert s.has_mid_tier is False
 
@@ -686,8 +895,12 @@ class TestSettingsMidTier:
         assert s.has_mid_tier is True
         assert s.MID_MODEL == "gpt-4.1-mini"
 
-    def test_default_thresholds(self):
+    def test_default_thresholds(self, monkeypatch):
+        # Import first (see test_default_no_mid) so load_dotenv() doesn't
+        # re-populate the var after we delete it.
         from nadirclaw.settings import Settings
+        # Hermetic: ignore any NADIRCLAW_TIER_THRESHOLDS from the dev env.
+        monkeypatch.delenv("NADIRCLAW_TIER_THRESHOLDS", raising=False)
         s = Settings()
         assert s.TIER_THRESHOLDS == (0.35, 0.65)
 

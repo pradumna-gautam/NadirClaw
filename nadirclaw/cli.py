@@ -3,8 +3,10 @@
 import json
 import os
 import shutil
+import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import click
 
@@ -97,34 +99,48 @@ def serve(port, simple_model, complex_model, models, token, verbose, log_raw, op
 @click.argument("prompt", nargs=-1, required=True)
 @click.option("--format", "fmt", default="text", type=click.Choice(["text", "json"]), help="Output format")
 def classify(prompt, fmt):
-    """Classify a prompt as simple or complex (no server needed)."""
+    """Classify a prompt with the configured analyzer (no server needed).
+
+    Honors NADIRCLAW_COMPLEXITY_ANALYZER (binary | distilbert).
+    """
+    import asyncio
     import logging
 
     logging.basicConfig(level=logging.WARNING)
 
-    from nadirclaw.classifier import BinaryComplexityClassifier
+    from nadirclaw.classifier import get_classifier
     from nadirclaw.settings import settings
 
     prompt_text = " ".join(prompt)
-    classifier = BinaryComplexityClassifier()
-    is_complex, confidence = classifier.classify(prompt_text)
+    classifier = get_classifier()
+    result = asyncio.run(classifier.analyze(text=prompt_text))
 
-    tier = "complex" if is_complex else "simple"
-    score = classifier._confidence_to_score(is_complex, confidence)
+    tier = result.get("tier_name") or "simple"
+    confidence = float(result.get("confidence") or 0.0)
+    score = float(result.get("complexity_score") or 0.0)
+    analyzer_type = result.get("analyzer_type", "binary")
 
-    # Pick model from explicit tier config
-    model = settings.COMPLEX_MODEL if is_complex else settings.SIMPLE_MODEL
+    if tier == "complex":
+        model = settings.COMPLEX_MODEL
+    elif tier == "mid":
+        model = settings.MID_MODEL
+    else:
+        model = settings.SIMPLE_MODEL
 
     if fmt == "json":
         click.echo(json.dumps({
             "tier": tier,
-            "is_complex": is_complex,
+            # Kept for backward compatibility with pre-3-class-analyzer
+            # scripts. "mid" counts as not-complex.
+            "is_complex": tier == "complex",
+            "analyzer": analyzer_type,
             "confidence": round(confidence, 4),
             "score": round(score, 4),
             "model": model,
             "prompt": prompt_text,
         }))
     else:
+        click.echo(f"Analyzer:   {analyzer_type}")
         click.echo(f"Tier:       {tier}")
         click.echo(f"Confidence: {confidence:.4f}")
         click.echo(f"Score:      {score:.4f}")
@@ -231,6 +247,81 @@ def status():
             click.echo(f"\nServer:        RUNNING ({data.get('status', '?')})")
     except Exception:
         click.echo("\nServer:        NOT RUNNING")
+
+
+@main.command("update-models")
+@click.option("--output", type=click.Path(path_type=Path), default=None,
+              help="Metadata file to write (default: ~/.nadirclaw/models.json)")
+@click.option("--source-url", default=None,
+              help="Optional registry JSON URL to merge before writing")
+@click.option("--dry-run", is_flag=True, help="Show what would be written without saving")
+@click.option("--format", "fmt", default="text", type=click.Choice(["text", "json"]),
+              help="Output format")
+def update_models(output, source_url, dry_run, fmt):
+    """Refresh local model metadata used by the router."""
+    import urllib.error
+    import urllib.request
+
+    from nadirclaw.model_metadata import (
+        default_metadata_path,
+        local_metadata_path,
+        parse_model_metadata,
+        write_model_metadata,
+    )
+    from nadirclaw.routing import BUILTIN_MODEL_REGISTRY
+
+    output_path = output or default_metadata_path()
+    models = {
+        model: dict(info)
+        for model, info in sorted(BUILTIN_MODEL_REGISTRY.items())
+    }
+    env_source = os.getenv("NADIRCLAW_MODEL_REGISTRY_URL", "")
+    source = source_url or env_source
+    if source and not source.startswith(("http://", "https://")):
+        raise click.ClickException(f"Source URL must use http(s): {source}")
+
+    if source:
+        max_bytes = 10 * 1024 * 1024  # 10 MiB cap on registry payload
+        try:
+            with urllib.request.urlopen(source, timeout=15) as resp:
+                raw = resp.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise click.ClickException(
+                    f"Registry payload exceeds {max_bytes} bytes: {source}"
+                )
+            remote_payload = json.loads(raw)
+            remote_models = parse_model_metadata(remote_payload)
+        except (OSError, ValueError, urllib.error.URLError) as e:
+            raise click.ClickException(str(e)) from e
+        for model, info in remote_models.items():
+            models[model] = {**models.get(model, {}), **info}
+
+    if not dry_run:
+        write_model_metadata(models, output_path, source=source or "builtin")
+
+    result = {
+        "path": str(output_path),
+        "local_override_path": str(local_metadata_path()),
+        "model_count": len(models),
+        "dry_run": dry_run,
+        "source": source or "builtin",
+        "models": list(models.keys()),
+    }
+
+    if fmt == "json":
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    action = "Would write" if dry_run else "Updated"
+    plural = "entry" if len(models) == 1 else "entries"
+    click.echo(f"{action} {len(models)} model metadata {plural}")
+    click.echo(f"Path: {output_path}")
+    click.echo(f"Source: {source or 'builtin'}")
+    click.echo(f"Local overrides: {local_metadata_path()}")
+    if models:
+        click.echo("Sample models:")
+        for model in list(models.keys())[:5]:
+            click.echo(f"  - {model}")
 
 
 @main.command()
@@ -1275,6 +1366,227 @@ def onboard():
     click.echo()
     click.echo(f"Verify: curl http://localhost:{settings.PORT}/v1/models")
     click.echo()
+
+
+@main.group()
+def claude():
+    """Claude Code seamless integration."""
+    pass
+
+
+@claude.command("onboard")
+@click.option(
+    "--base-url",
+    default=None,
+    help="ANTHROPIC_BASE_URL to write into Claude Code settings "
+    "(default: http://localhost:<PORT>). Claude Code appends `/v1/messages` "
+    "itself, so do NOT include a /v1 suffix.",
+)
+@click.option(
+    "--api-key",
+    default="local",
+    show_default=True,
+    help="ANTHROPIC_API_KEY value to write into Claude Code settings.",
+)
+@click.option(
+    "--no-daemon",
+    is_flag=True,
+    help="Skip installing the launchd/systemd auto-start unit.",
+)
+@click.option(
+    "--no-settings",
+    is_flag=True,
+    help="Skip editing ~/.claude/settings.json.",
+)
+@click.option(
+    "--detect-only",
+    is_flag=True,
+    help="Show detected tier mapping and exit without writing anything.",
+)
+@click.option(
+    "--interactive/--no-interactive",
+    "-i/-I",
+    default=None,
+    help="Pick a model for each tier from a menu. Auto-enabled when no "
+    "real config or live API result is available.",
+)
+@click.option(
+    "--default-profile",
+    type=click.Choice(["nadir-auto", "nadir-eco", "nadir-premium", "nadir-reasoning", "nadir-free", "off"]),
+    default=None,
+    help="Set ANTHROPIC_MODEL in settings.json so every `claude` launch routes "
+    "through this profile by default. 'off' leaves Claude Code's picker in "
+    "charge (proxy will just pass through whatever it sends).",
+)
+def claude_onboard(base_url, api_key, no_daemon, no_settings, detect_only, interactive, default_profile):
+    """Make Claude Code talk to NadirClaw automatically.
+
+    Detects the models Claude Code is configured to use, maps them into
+    NadirClaw's routing tiers, persists ANTHROPIC_BASE_URL into Claude Code's
+    settings, and installs a user-scope auto-start unit so the proxy is always
+    up when you run `claude`.
+    """
+    from nadirclaw.claude_integration import (
+        CLAUDE_SETTINGS_FILE,
+        detect_models,
+        gather_candidate_models,
+        install_daemon,
+        interactive_pick_models,
+        patch_claude_settings,
+        update_env_file,
+    )
+    from nadirclaw.settings import settings as nadir_settings
+
+    detected = detect_models()
+    click.echo("Detected Claude Code models:")
+    for tier in ("simple", "mid", "complex", "reasoning"):
+        value = getattr(detected, tier)
+        click.echo(f"  {tier:<10} {value or '—'}")
+    click.echo(f"  sources    {', '.join(detected.sources) or '—'}")
+
+    # Auto-enable interactive when detection only saw the hardcoded fallback
+    # (i.e. neither Claude Code config nor the live Anthropic API produced
+    # anything). Skip auto when --detect-only or stdin isn't a tty.
+    should_prompt = interactive
+    if should_prompt is None and not detect_only:
+        only_defaults = detected.sources == ["defaults"]
+        should_prompt = only_defaults and sys.stdin.isatty()
+
+    if should_prompt:
+        pool = gather_candidate_models()
+        detected = interactive_pick_models(pool, defaults=detected)
+        click.echo("Final tier mapping:")
+        for tier in ("simple", "mid", "complex", "reasoning"):
+            value = getattr(detected, tier)
+            click.echo(f"  {tier:<10} {value or '—'}")
+
+    # Resolve the default routing profile (what Claude Code sends as `model`).
+    # Without this, Claude Code defaults to opus/sonnet/haiku and the proxy
+    # just passes through — no smart routing happens.
+    chosen_profile: Optional[str] = default_profile
+    if chosen_profile is None and should_prompt and not detect_only:
+        click.echo(
+            "\nWhich profile should `claude` use by default?\n"
+            "  [1] nadir-auto      — smart routing per prompt (recommended)\n"
+            "  [2] nadir-eco       — always cheapest tier\n"
+            "  [3] nadir-premium   — always strongest tier\n"
+            "  [4] nadir-reasoning — always reasoning tier\n"
+            "  [5] off             — leave Claude Code's picker in charge"
+        )
+        pick = click.prompt("  pick", default="1", show_default=True).strip()
+        chosen_profile = {
+            "1": "nadir-auto", "nadir-auto": "nadir-auto",
+            "2": "nadir-eco", "nadir-eco": "nadir-eco",
+            "3": "nadir-premium", "nadir-premium": "nadir-premium",
+            "4": "nadir-reasoning", "nadir-reasoning": "nadir-reasoning",
+            "5": "off", "off": "off",
+        }.get(pick.lower(), "nadir-auto")
+
+    if chosen_profile == "off":
+        chosen_profile = None  # don't write ANTHROPIC_MODEL
+
+    if detect_only:
+        return
+
+    env_path = update_env_file(detected)
+    click.echo(f"\nUpdated tier mapping in {env_path}")
+
+    # Claude Code expects ANTHROPIC_BASE_URL to be the bare host. It appends
+    # `/v1/messages` itself, so a `/v1` suffix here produces `/v1/v1/messages`.
+    resolved_base = base_url or f"http://localhost:{nadir_settings.PORT}"
+    resolved_base = resolved_base.rstrip("/")
+    if resolved_base.endswith("/v1"):
+        resolved_base = resolved_base[:-3]
+
+    if no_settings:
+        click.echo("Skipped editing Claude Code settings (--no-settings).")
+    else:
+        patched = patch_claude_settings(
+            resolved_base, api_key=api_key, default_profile=chosen_profile
+        )
+        click.echo(f"Wrote ANTHROPIC_BASE_URL={resolved_base} to {patched}")
+        if chosen_profile:
+            click.echo(f"Set ANTHROPIC_MODEL={chosen_profile} (every `claude` launch routes through this)")
+        else:
+            click.echo("Left ANTHROPIC_MODEL untouched — Claude Code's picker controls routing.")
+
+    if no_daemon:
+        click.echo("Skipped daemon install (--no-daemon).")
+    else:
+        installed = install_daemon(port=nadir_settings.PORT)
+        if installed:
+            click.echo(f"Installed auto-start unit at {installed}")
+        else:
+            click.echo(
+                "Auto-start unit not installed (unsupported OS). "
+                "Run `nadirclaw serve` manually or use `nadirclaw claude shim install`."
+            )
+
+    click.echo("\nDone. Open a new shell and run `claude` — it will route through NadirClaw.")
+    click.echo("Inside Claude Code, `/model` lists nadir-auto / nadir-eco / nadir-premium / nadir-reasoning.")
+
+
+@claude.command("shim")
+@click.argument("action", type=click.Choice(["install", "uninstall", "status"]), default="install")
+def claude_shim(action):
+    """Install a lazy-start `claude` wrapper on PATH.
+
+    The wrapper checks whether NadirClaw is already serving on its port; if not,
+    it starts the proxy in the background, exports ANTHROPIC_BASE_URL, and execs
+    the real `claude` binary. No background daemon, no settings.json edit.
+    """
+    from nadirclaw.claude_integration import (
+        SHIM_DIR,
+        SHIM_PATH,
+        install_shim,
+        uninstall_shim,
+    )
+    from nadirclaw.settings import settings as nadir_settings
+
+    if action == "status":
+        if SHIM_PATH.exists():
+            click.echo(f"Shim installed at {SHIM_PATH}")
+        else:
+            click.echo("Shim not installed.")
+        on_path = os.environ.get("PATH", "").split(os.pathsep)
+        click.echo(f"On PATH: {'yes' if str(SHIM_DIR) in on_path else 'no'}")
+        return
+
+    if action == "uninstall":
+        if uninstall_shim():
+            click.echo(f"Removed {SHIM_PATH}")
+        else:
+            click.echo("Shim was not installed.")
+        return
+
+    path = install_shim(port=nadir_settings.PORT)
+    click.echo(f"Installed shim at {path}")
+    click.echo("\nAdd this to your shell rc so `claude` resolves to the shim:")
+    click.echo(f'  export PATH="{path.parent}:$PATH"')
+    click.echo("\nThen just run `claude` — the shim will start NadirClaw on demand.")
+
+
+@claude.command("uninstall")
+def claude_uninstall():
+    """Remove all Claude Code integration artifacts (daemon, shim, settings entries)."""
+    from nadirclaw.claude_integration import (
+        uninstall_daemon,
+        uninstall_shim,
+        unpatch_claude_settings,
+    )
+
+    removed_daemon = uninstall_daemon()
+    for p in removed_daemon:
+        click.echo(f"Removed daemon unit {p}")
+
+    if uninstall_shim():
+        click.echo("Removed claude shim")
+
+    if unpatch_claude_settings():
+        click.echo("Cleared ANTHROPIC_BASE_URL/ANTHROPIC_API_KEY from Claude Code settings")
+
+    if not removed_daemon:
+        click.echo("(no daemon unit was installed)")
 
 
 @main.group()
